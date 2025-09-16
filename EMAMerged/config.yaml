@@ -1,0 +1,59 @@
+# === EMAMerged/config.yaml ===
+
+# DATA / SESSION
+timezone: "US/Eastern"
+rth_only: true
+rth_start: "09:30"
+rth_end:   "15:55"
+feed: "iex"              # Alpaca market data: "iex" is fine for paper
+timeframe: "5Min"        # live cadence (5-minute bars)
+history_days: 30         # how much to fetch each call
+bar_limit: 500           # safety cap
+
+# ENTRY WINDOWS (local time, optional)
+entry_windows:
+  - { start: "09:35", end: "12:00" }
+  - { start: "13:00", end: "15:45" }
+
+# CORE STRATEGY
+ema_fast: 9
+ema_slow: 21
+atr_period: 14
+
+# FILTERS (all must pass to enter long)
+filters:
+  enabled: true
+
+  # ADX / DI
+  adx_len: 14
+  adx_threshold: 22
+  require_plus_di_over_minus: true
+  di_margin: 0
+
+  # RSI
+  rsi_period: 14
+  rsi_min: 50
+  rsi_max: 80
+
+  # EMA slope (% over lookback)
+  slope_mode: "percent"        # "percent" or "atr"
+  slope_lookback: 3
+  slope_threshold_pct: 0.0012  # 12 bps (0.12%) on EMA9
+  slope_threshold_atr: 0.15    # only if slope_mode == "atr"
+  require_ema21_slope_up: true
+
+  # Optional anti-whipsaw
+  ema_separation_bps: 0.0
+
+# POSITION / RISK
+allow_shorts: false
+qty: 1                    # fixed size (paper alignment)
+max_notional_per_trade: 5000
+
+# Bracket logic (basic R multiple)
+atr_mult_sl: 1.2          # SL distance ~1.2*ATR
+take_profit_r: 1.0        # TP at +1R
+time_stop_bars: 8         # optional time stop (bars), if you add later
+
+# OUTPUT
+results_dir: "results"
