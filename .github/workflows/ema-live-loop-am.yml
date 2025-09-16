@@ -1,0 +1,67 @@
+name: EMA Live Paper (AM loop, self-hosted Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Comma-separated symbols (leave blank to use EMAMerged/tickers.txt)"
+        required: false
+        default: ""
+      dry_run:
+        description: "1 = log orders only (no submissions)"
+        required: false
+        default: "1"
+      force_run:
+        description: "1 = bypass market-hours gate"
+        required: false
+        default: "0"
+  schedule:
+    # Every 5 min, Mon-Fri, 13:30-20:00 UTC (~9:30-16:00 ET). Script also checks market clock.
+    - cron: "*/5 13-20 * * 1-5"
+
+jobs:
+  live:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Python (absolute path)
+        run: |
+          $candidates = @(
+            "C:\Users\vraoo\AppData\Local\Programs\Python\Python313\python.exe",
+            "C:\Program Files\Python313\python.exe",
+            "C:\Program Files\Python311\python.exe"
+          )
+          $py = $null
+          foreach ($p in $candidates) { if (Test-Path $p) { $py = $p; break } }
+          if (-not $py) { throw "Python not found. Adjust candidates in workflow." }
+          echo "PYTHON_EXE=$py" >> $env:GITHUB_ENV
+          & "$py" --version
+          & "$py" -c "import sys; print(sys.executable)"
+
+      - name: Install deps
+        run: |
+          & "$env:PYTHON_EXE" -m pip install --upgrade pip
+          & "$env:PYTHON_EXE" -m pip install -r EMAMerged/requirements.txt
+
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+
+      - name: Run once (paper)
+        env:
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_BASE_URL:   ${{ secrets.ALPACA_BASE_URL }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run }}
+          FORCE_RUN:         ${{ github.event.inputs.force_run }}
+        run: |
+          $SYMS = "${{ github.event.inputs.tickers }}"
+          if ([string]::IsNullOrWhiteSpace($SYMS)) {
+            & "$env:PYTHON_EXE" EMAMerged/scripts/live_paper_loop.py --config EMAMerged/config.yaml --tickers EMAMerged/tickers.txt --dry-run $env:DRY_RUN --force-run $env:FORCE_RUN
+          } else {
+            & "$env:PYTHON_EXE" EMAMerged/scripts/live_paper_loop.py --config EMAMerged/config.yaml --symbols "$SYMS" --dry-run $env:DRY_RUN --force-run $env:FORCE_RUN
+          }
