@@ -1,64 +1,27 @@
-# === EMAMerged/config.yaml ===
-
-# DATA / SESSION
-timezone: "US/Eastern"
-rth_only: true
-rth_start: "09:30"
-rth_end:   "15:55"
-feed: "iex"
-timeframe: "5Min"        # live cadence
+timeframe: "15Min"
 history_days: 30
 bar_limit: 500
+feed: "iex"
 
-# ENTRY WINDOWS (local time)
-entry_windows:
-  - { start: "09:35", end: "12:00" }
-  - { start: "13:00", end: "15:45" }
-
-# Near close guard: block NEW entries within last N minutes before rth_end
-no_new_entries_last_min: 10
-
-# CORE STRATEGY
-ema_fast: 9
-ema_slow: 21
-atr_period: 14
-
-# FILTERS (all must pass to enter long)
 filters:
-  enabled: true
+  # STRONGER TREND
+  adx_period: 14
+  adx_threshold: 25        # ↑ stricter than typical 20-22
 
-  # ADX / DI
-  adx_len: 14
-  adx_threshold: 22
-  require_plus_di_over_minus: true
-  di_margin: 0
-
-  # RSI
+  # MOMENTUM BOUNDS (optional)
   rsi_period: 14
-  rsi_min: 50
+  rsi_min: 45              # example; set to null / remove to disable
   rsi_max: 80
 
-  # EMA slope
-  slope_mode: "percent"        # "percent" or "atr"
-  slope_lookback: 3
-  slope_threshold_pct: 0.0012  # 12 bps (0.12%)
-  slope_threshold_atr: 0.15
-  require_ema21_slope_up: true
+  # POSITIVE SLOPE (optional)
+  slope_threshold_pct: 0.0012   # +0.12% per bar; raise to be stricter
 
-  # Optional anti-whipsaw
-  ema_separation_bps: 0.0
+  # AVOID PENNIES / ILLIQUID (optional)
+  min_price: 10.0
+  min_dollar_vol: 5000000       # $5M average over the window
+  dollar_vol_window: 20
 
-# POSITION / RISK
-allow_shorts: false
-qty: 1                        # ALWAYS 1 share per entry
-max_notional_per_trade: 2000  # skip entries if price > $2,000
-
-# Brackets (enable to place stop/TP immediately on entry)
 brackets:
   enabled: true
-  atr_mult_sl: 1.2            # SL distance ~ 1.2 * ATR
-  take_profit_r: 1.0          # TP at +1R (R = entry - stop distance)
-  submit_as: "bracket"        # Alpaca bracket order class
-
-# OUTPUT
-results_dir: "results"
+  atr_mult_sl: 1.0        # tighter stop than 1.2 (more defensive)
+  take_profit_r: 1.2      # optional: increase TP to 1.2R if you tighten SL
