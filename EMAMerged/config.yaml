@@ -1,6 +1,6 @@
 timeframe: "15Min"
 history_days: 30
-bar_limit: 500
+bar_limit: 10000
 feed: "iex"
 
 filters:
