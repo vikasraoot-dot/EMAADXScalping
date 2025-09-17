@@ -6,7 +6,7 @@ feed: "iex"
 filters:
   # STRONGER TREND
   adx_period: 14
-  adx_threshold: 24        # ↑ stricter than typical 20-22
+  adx_threshold: 23        # ↑ stricter than typical 20-22
 
   # MOMENTUM BOUNDS (optional)
   rsi_period: 14
