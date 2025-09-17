@@ -1,0 +1,55 @@
+name: EMA Merged Backtest (30d, self-hosted Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Comma-separated symbols (blank = EMAMerged/tickers.txt)"
+        required: false
+        default: ""
+      days:
+        description: "Lookback days"
+        required: false
+        default: "30"
+
+jobs:
+  bt:
+    runs-on: [self-hosted, windows]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Python path
+        run: echo "PYTHON_EXE=C:\Program Files\Python313\python.exe" >> $env:GITHUB_ENV
+
+      - name: Install deps
+        run: |
+          & "$env:PYTHON_EXE" -m pip install --upgrade pip
+          & "$env:PYTHON_EXE" -m pip install -r EMAMerged/requirements.txt
+
+      - name: Force UTF-8 + Alpaca URL
+        run: |
+          chcp 65001 > $null
+          $val = "${{ secrets.ALPACA_BASE_URL }}".Trim()
+          if (-not $val) { $val = "https://paper-api.alpaca.markets" }
+          echo "APCA_API_BASE_URL=$val" >> $env:GITHUB_ENV
+
+      - name: Run backtest
+        env:
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
+        run: |
+          $syms = "${{ github.event.inputs.tickers }}".Trim()
+          $argSyms = ""
+          if ($syms) {
+            $list = $syms -split '[\s,]+' | Where-Object { $_ -ne "" } | Select-Object -Unique
+            $argSyms = "--symbols " + ($list -join ',')
+          }
+          & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/backtest_30d.py `
+            $argSyms `
+            --tickers EMAMerged/tickers.txt `
+            --days ${{ github.event.inputs.days }} `
+            --cash 10000 `
+            --risk 0.01
