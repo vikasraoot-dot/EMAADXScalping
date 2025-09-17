@@ -238,7 +238,7 @@ def main():
     ap.add_argument("--config", default="EMAMerged/config.yaml")
     ap.add_argument("--tickers", default="EMAMerged/tickers.txt")
     ap.add_argument("--symbols", default="")
-    ap.add_argument("--dry-run", type=int, default=int(os.environ.get("DRY_RUN", "1")))
+    ap.add_argument("--dry-run", type=int, default=int(os.environ.get("DRY_RUN", "0")))
     ap.add_argument("--force-run", type=int, default=int(os.environ.get("FORCE_RUN", "0")))
     args = ap.parse_args()
 
