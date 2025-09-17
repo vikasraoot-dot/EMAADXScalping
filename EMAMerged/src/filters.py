@@ -43,7 +43,8 @@ def _compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     dx = ( (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan) ) * 100
     adx = dx.ewm(alpha=1/period, adjust=False).mean()
 
-    return adx.fillna(method="bfill").fillna(0.0)
+    return adx.bfill().fillna(0.0)
+
 
 
 def _ensure_rsi(df: pd.DataFrame, rsi_col: str = "rsi", period: int = 14) -> pd.DataFrame:
