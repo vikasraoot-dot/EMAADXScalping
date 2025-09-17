@@ -53,7 +53,7 @@ def get_alpaca_bars(
     secret: str,
     symbol: str,
     timeframe: str = "5Min",
-    history_days: int = 30,
+    history_days: int = 90,
     bar_limit: int = 500,
     feed: str = "iex",
 ) -> pd.DataFrame:
