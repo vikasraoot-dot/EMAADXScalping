@@ -45,7 +45,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Fixed system-wide Python path (service-friendly)
       - name: Set Python path
         run: |
           echo "PYTHON_EXE=C:\Program Files\Python313\python.exe" >> $env:GITHUB_ENV
@@ -63,7 +62,6 @@ jobs:
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
 
-      # Prevent UnicodeEncodeError on Windows service accounts
       - name: Force UTF-8 (PowerShell + Python)
         run: |
           chcp 65001 > $null
@@ -73,13 +71,19 @@ jobs:
           echo "PYTHONUTF8=1"            >> $env:GITHUB_ENV
           echo "PYTHONIOENCODING=utf-8"  >> $env:GITHUB_ENV
 
-      # Normalize symbols from input/file and run once
+      - name: Ensure Alpaca base URL
+        run: |
+          $val = "${{ secrets.ALPACA_BASE_URL }}".Trim()
+          if (-not $val) { $val = "https://paper-api.alpaca.markets" }
+          echo "ALPACA_BASE_URL=$val"   >> $env:GITHUB_ENV
+          echo "APCA_API_BASE_URL=$val" >> $env:GITHUB_ENV
+          Write-Host "Using Alpaca URL: $val"
+
       - name: Run live loop once
         env:
-          # Alpaca
+          # Alpaca creds
           ALPACA_API_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
-          ALPACA_BASE_URL:   ${{ secrets.ALPACA_BASE_URL }}
 
           # Optional filter overrides
           FILTER_ADX:        ${{ github.event.inputs.adx }}
