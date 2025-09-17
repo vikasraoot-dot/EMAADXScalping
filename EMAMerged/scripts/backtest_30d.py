@@ -4,6 +4,12 @@ import os, sys, argparse
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 
+# --- Add repo root to sys.path so "EMAMerged" imports work when run as a script ---
+_THIS = os.path.abspath(os.path.dirname(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS, "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from EMAMerged.src.utils import load_config, read_tickers, round2
 from EMAMerged.src.data import (
     get_alpaca_bars, filter_rth, drop_unclosed_last_bar,
@@ -24,6 +30,7 @@ def _alpaca_creds():
     return base, key, secret
 
 def load_bars_for_symbol(sym: str, cfg: dict, days: int) -> pd.DataFrame:
+    # creds read only to satisfy interface; get_alpaca_bars handles auth internally
     base, key, secret = _alpaca_creds()
     tf = cfg.get("timeframe", "5Min")
     feed = cfg.get("feed", "iex")
@@ -105,7 +112,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
                 tp_px   = entry_px + take_profit_r * r_per_sh
                 hit_sl = cur["low"]  <= stop_px
                 hit_tp = cur["high"] >= tp_px
-                # If both could be hit, assume worst-case fill (conservative): stop first
+                # Conservative fill ordering: stop before TP if both touched
                 if hit_sl:
                     pnl = (stop_px - entry_px) * qty
                     equity += pnl; gross += pnl
@@ -140,4 +147,48 @@ def main():
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--cash", type=float, default=10_000)
     ap.add_argument("--risk", type=float, default=0.01)
-    args = ap.p
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+
+    # Resolve symbols
+    if args.symbols.strip():
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = read_tickers(args.tickers)
+
+    rows = []
+    for sym in symbols:
+        try:
+            df = load_bars_for_symbol(sym, cfg, args.days)
+        except Exception as e:
+            print(f"[{sym}] data error: {e}")
+            continue
+
+        if df.empty:
+            print(f"[{sym}] no bars")
+            continue
+
+        res = simulate_long_only(df, cfg, start_cash=args.cash, risk_per_trade=args.risk)
+        rows.append({"symbol": sym, **res})
+
+    if not rows:
+        print("No results.")
+        return
+
+    out = pd.DataFrame(rows).sort_values("net", ascending=False)
+    print("\n=== Backtest Summary (last {} days) ===".format(args.days))
+    print(out.to_string(index=False))
+
+    total_trades = int(out["trades"].sum())
+    total_net = round(float(out["net"].sum()), 2)
+    avg_winrate = round((out["trades"] * out["win_rate"] / 100.0).sum() / max(total_trades, 1) * 100.0, 1)
+    avg_ret = round(float(out["ret_pct"].mean()), 2)
+    total_equity = round(float(out["equity"].sum()), 2)
+
+    print("\nTOTAL  trades={}  net={}  win_rate={}%%  avg_ret={}%%  equity_sum={}".format(
+        total_trades, total_net, avg_winrate, avg_ret, total_equity
+    ))
+
+if __name__ == "__main__":
+    main()
