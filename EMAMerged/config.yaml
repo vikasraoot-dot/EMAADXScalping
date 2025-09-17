@@ -5,15 +5,18 @@ timezone: "US/Eastern"
 rth_only: true
 rth_start: "09:30"
 rth_end:   "15:55"
-feed: "iex"              # Alpaca market data: "iex" is fine for paper
-timeframe: "5Min"        # live cadence (5-minute bars)
-history_days: 30         # how much to fetch each call
-bar_limit: 500           # safety cap
+feed: "iex"
+timeframe: "5Min"        # live cadence
+history_days: 30
+bar_limit: 500
 
-# ENTRY WINDOWS (local time, optional)
+# ENTRY WINDOWS (local time)
 entry_windows:
   - { start: "09:35", end: "12:00" }
   - { start: "13:00", end: "15:45" }
+
+# Near close guard: block NEW entries within last N minutes before rth_end
+no_new_entries_last_min: 10
 
 # CORE STRATEGY
 ema_fast: 9
@@ -35,11 +38,11 @@ filters:
   rsi_min: 50
   rsi_max: 80
 
-  # EMA slope (% over lookback)
+  # EMA slope
   slope_mode: "percent"        # "percent" or "atr"
   slope_lookback: 3
-  slope_threshold_pct: 0.0012  # 12 bps (0.12%) on EMA9
-  slope_threshold_atr: 0.15    # only if slope_mode == "atr"
+  slope_threshold_pct: 0.0012  # 12 bps (0.12%)
+  slope_threshold_atr: 0.15
   require_ema21_slope_up: true
 
   # Optional anti-whipsaw
@@ -47,13 +50,15 @@ filters:
 
 # POSITION / RISK
 allow_shorts: false
-qty: 1                    # fixed size (paper alignment)
-max_notional_per_trade: 5000
+qty: 1                        # ALWAYS 1 share per entry
+max_notional_per_trade: 2000  # skip entries if price > $2,000
 
-# Bracket logic (basic R multiple)
-atr_mult_sl: 1.2          # SL distance ~1.2*ATR
-take_profit_r: 1.0        # TP at +1R
-time_stop_bars: 8         # optional time stop (bars), if you add later
+# Brackets (enable to place stop/TP immediately on entry)
+brackets:
+  enabled: true
+  atr_mult_sl: 1.2            # SL distance ~ 1.2 * ATR
+  take_profit_r: 1.0          # TP at +1R (R = entry - stop distance)
+  submit_as: "bracket"        # Alpaca bracket order class
 
 # OUTPUT
 results_dir: "results"
