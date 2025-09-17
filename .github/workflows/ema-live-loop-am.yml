@@ -33,7 +33,7 @@ on:
         default: ""
   # Cron is UTC; 13–20 ≈ 9:00–4:59 ET during DST
   schedule:
-    - cron: "*/5 13-20 * * 1-5"
+    - cron: "*/5 13-21 * * 1-5"
 
 jobs:
   live:
