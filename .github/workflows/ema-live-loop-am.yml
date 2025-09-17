@@ -31,6 +31,7 @@ on:
         description: "Override EMA9 slope pct (e.g. 0.0012)"
         required: false
         default: ""
+  # Cron is UTC; 13–20 ≈ 9:00–4:59 ET during DST
   schedule:
     - cron: "*/5 13-20 * * 1-5"
 
@@ -44,18 +45,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve Python (absolute path)
+      # Fixed system-wide Python path (service-friendly)
+      - name: Set Python path
         run: |
-          $candidates = @(
-            "C:\Users\vraoo\AppData\Local\Programs\Python\Python313\python.exe",
-            "C:\Program Files\Python313\python.exe",
-            "C:\Program Files\Python311\python.exe"
-          )
-          $py = $null
-          foreach ($p in $candidates) { if (Test-Path $p) { $py = $p; break } }
-          if (-not $py) { throw "Python not found. Adjust candidates." }
-          echo "PYTHON_EXE=$py" >> $env:GITHUB_ENV
-          & "$py" --version
+          echo "PYTHON_EXE=C:\Program Files\Python313\python.exe" >> $env:GITHUB_ENV
+
+      - name: Show Python
+        run: |
+          & "$env:PYTHON_EXE" --version
+          & "$env:PYTHON_EXE" -c "import sys; print(sys.executable)"
 
       - name: Install deps
         run: |
@@ -65,6 +63,17 @@ jobs:
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
 
+      # Prevent UnicodeEncodeError on Windows service accounts
+      - name: Force UTF-8 (PowerShell + Python)
+        run: |
+          chcp 65001 > $null
+          $env:PYTHONUTF8 = "1"
+          $env:PYTHONIOENCODING = "utf-8"
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          echo "PYTHONUTF8=1"            >> $env:GITHUB_ENV
+          echo "PYTHONIOENCODING=utf-8"  >> $env:GITHUB_ENV
+
+      # Normalize symbols from input/file and run once
       - name: Run live loop once
         env:
           # Alpaca
@@ -72,19 +81,39 @@ jobs:
           ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
           ALPACA_BASE_URL:   ${{ secrets.ALPACA_BASE_URL }}
 
-          # Overrides (optional)
+          # Optional filter overrides
           FILTER_ADX:        ${{ github.event.inputs.adx }}
           FILTER_RSI_MIN:    ${{ github.event.inputs.rsi_min }}
           FILTER_RSI_MAX:    ${{ github.event.inputs.rsi_max }}
           FILTER_SLOPE_PCT:  ${{ github.event.inputs.slope_pct }}
 
-          # Control
+          # Control flags
           DRY_RUN:           ${{ github.event.inputs.dry_run }}
           FORCE_RUN:         ${{ github.event.inputs.force_run }}
+
+          # Live log streaming
+          PYTHONUNBUFFERED:  "1"
         run: |
-          $SYMS = "${{ github.event.inputs.tickers }}"
-          if ([string]::IsNullOrWhiteSpace($SYMS)) {
-            & "$env:PYTHON_EXE" EMAMerged/scripts/live_paper_loop.py --config EMAMerged/config.yaml --tickers EMAMerged/tickers.txt --dry-run $env:DRY_RUN --force-run $env:FORCE_RUN
+          # Resolve symbols from input or fallback file and normalize
+          $syms = "${{ github.event.inputs.tickers }}".Trim()
+          if (-not $syms) {
+            if (Test-Path "EMAMerged/tickers.txt") {
+              $syms = (Get-Content "EMAMerged/tickers.txt" -Raw)
+            }
+          }
+          $list = $syms -split '[\s,]+' | Where-Object { $_ -ne "" } | Select-Object -Unique
+          $symbols = ($list -join ',')
+
+          if ([string]::IsNullOrWhiteSpace($symbols)) {
+            & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/live_paper_loop.py `
+              --config EMAMerged/config.yaml `
+              --tickers EMAMerged/tickers.txt `
+              --dry-run $env:DRY_RUN `
+              --force-run $env:FORCE_RUN
           } else {
-            & "$env:PYTHON_EXE" EMAMerged/scripts/live_paper_loop.py --config EMAMerged/config.yaml --symbols "$SYMS" --dry-run $env:DRY_RUN --force-run $env:FORCE_RUN
+            & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/live_paper_loop.py `
+              --config EMAMerged/config.yaml `
+              --symbols "$symbols" `
+              --dry-run $env:DRY_RUN `
+              --force-run $env:FORCE_RUN
           }
