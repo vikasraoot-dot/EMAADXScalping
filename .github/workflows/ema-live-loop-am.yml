@@ -4,19 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       tickers:
-        description: "Comma-separated symbols (leave blank to use EMAMerged/tickers.txt)"
+        description: "Comma-separated symbols (blank = EMAMerged/tickers.txt)"
         required: false
         default: ""
       dry_run:
-        description: "1 = log orders only (no submissions)"
+        description: "1=log only, 0=live"
         required: false
         default: "1"
       force_run:
-        description: "1 = bypass market-hours gate"
+        description: "1=bypass market-hours gate"
         required: false
         default: "0"
+      adx:
+        description: "Override ADX threshold (blank=default)"
+        required: false
+        default: ""
+      rsi_min:
+        description: "Override RSI min (blank=default)"
+        required: false
+        default: ""
+      rsi_max:
+        description: "Override RSI max (blank=default)"
+        required: false
+        default: ""
+      slope_pct:
+        description: "Override EMA9 slope pct (e.g. 0.0012)"
+        required: false
+        default: ""
   schedule:
-    # Every 5 min, Mon-Fri, 13:30-20:00 UTC (~9:30-16:00 ET). Script also checks market clock.
     - cron: "*/5 13-20 * * 1-5"
 
 jobs:
@@ -38,10 +53,9 @@ jobs:
           )
           $py = $null
           foreach ($p in $candidates) { if (Test-Path $p) { $py = $p; break } }
-          if (-not $py) { throw "Python not found. Adjust candidates in workflow." }
+          if (-not $py) { throw "Python not found. Adjust candidates." }
           echo "PYTHON_EXE=$py" >> $env:GITHUB_ENV
           & "$py" --version
-          & "$py" -c "import sys; print(sys.executable)"
 
       - name: Install deps
         run: |
@@ -51,11 +65,20 @@ jobs:
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
 
-      - name: Run once (paper)
+      - name: Run live loop once
         env:
+          # Alpaca
           ALPACA_API_KEY:    ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
           ALPACA_BASE_URL:   ${{ secrets.ALPACA_BASE_URL }}
+
+          # Overrides (optional)
+          FILTER_ADX:        ${{ github.event.inputs.adx }}
+          FILTER_RSI_MIN:    ${{ github.event.inputs.rsi_min }}
+          FILTER_RSI_MAX:    ${{ github.event.inputs.rsi_max }}
+          FILTER_SLOPE_PCT:  ${{ github.event.inputs.slope_pct }}
+
+          # Control
           DRY_RUN:           ${{ github.event.inputs.dry_run }}
           FORCE_RUN:         ${{ github.event.inputs.force_run }}
         run: |
