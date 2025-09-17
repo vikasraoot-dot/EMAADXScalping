@@ -63,7 +63,7 @@ jobs:
           ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
 
           # Control flags for the one-shot script it calls
-          DRY_RUN:  "1"   # set to "0" to go live
+          DRY_RUN:  "0"   # set to "0" to go live
           FORCE_RUN: "0"  # the outer loop already gates on RTH
 
           # (Optional) override & debugging
