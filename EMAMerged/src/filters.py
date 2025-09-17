@@ -1,77 +1,151 @@
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Dict, Optional
 import pandas as pd
-from .indicators import adx_di, ema_slope_pct, ema_slope_atr, rsi as rsi_ind
+import numpy as np
 
-def attach_verifiers(df: pd.DataFrame, cfg: Dict[str, Any],
-                     ema_fast_col: str = "ema_fast", ema_slow_col: str = "ema_slow") -> pd.DataFrame:
-    out = df.copy()
-    fcfg = cfg.get("filters", {})
+# ------------------------------------------------------------
+# ADX/RSI/EMA-slope verifiers for the "long gate"
+# ------------------------------------------------------------
 
-    # ADX / DI
-    adx_len = int(fcfg.get("adx_len", 14))
-    plus_di, minus_di, adx = adx_di(out["high"], out["low"], out["close"], length=adx_len)
-    out["plus_di"] = plus_di
-    out["minus_di"] = minus_di
-    out["adx"] = adx
+def _compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Wilder's ADX using pandas. Expects columns: high, low, close.
+    Returns ADX(series) aligned to df.index.
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
 
-    # RSI
-    rsi_period = int(fcfg.get("rsi_period", cfg.get("rsi_period", 14)))
-    out["rsi"] = rsi_ind(out["close"], length=rsi_period)
+    up = high.diff()
+    down = -low.diff()
 
-    # Slopes
-    lookback = int(fcfg.get("slope_lookback", 3))
-    out["ema_fast_slope_pct"] = ema_slope_pct(out[ema_fast_col], lookback=lookback)
-    out["ema_slow_slope_pct"] = ema_slope_pct(out[ema_slow_col], lookback=lookback)
-    if "atr" in out.columns:
-        out["ema_fast_slope_atr"] = ema_slope_atr(out[ema_fast_col], out["atr"], lookback=lookback)
-        out["ema_slow_slope_atr"] = ema_slope_atr(out[ema_slow_col], out["atr"], lookback=lookback)
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
-    return out
+    tr_components = pd.concat([
+        (high - low),
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1)
+    tr = tr_components.max(axis=1)
 
-def long_ok(row: pd.Series, cfg: Dict[str, Any],
-            ema_fast_col: str = "ema_fast", ema_slow_col: str = "ema_slow") -> bool:
-    fcfg = cfg.get("filters", {})
-    if not bool(fcfg.get("enabled", True)):
-        return True
+    # Wilder's smoothing (EMA with alpha=1/period approximates Wilder reasonably for backtest)
+    tr_n = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_dm_n = pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean()
+    minus_dm_n = pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean()
 
-    # ADX/DI
-    if float(row.get("adx", 0.0)) < float(fcfg.get("adx_threshold", 22)):
-        return False
-    if bool(fcfg.get("require_plus_di_over_minus", True)):
-        margin = float(fcfg.get("di_margin", 0.0))
-        if float(row.get("plus_di", 0.0)) < float(row.get("minus_di", 0.0)) + margin:
-            return False
+    # Avoid divide by zero
+    tr_n = tr_n.replace(0.0, np.nan)
 
-    # RSI
-    rsi_min = float(fcfg.get("rsi_min", 50))
-    rsi_max = float(fcfg.get("rsi_max", 100))
-    r = float(row.get("rsi", 0.0))
-    if (r < rsi_min) or (r > rsi_max):
-        return False
+    pdi = 100 * (plus_dm_n / tr_n)
+    mdi = 100 * (minus_dm_n / tr_n)
 
-    # Slope
-    mode = str(fcfg.get("slope_mode", "percent")).lower()
-    require_ema21_up = bool(fcfg.get("require_ema21_slope_up", True))
-    if mode == "atr":
-        thr = float(fcfg.get("slope_threshold_atr", 0.15))
-        fast_ok = float(row.get("ema_fast_slope_atr", 0.0)) >= thr
-        slow_ok = float(row.get("ema_slow_slope_atr", 0.0)) > 0.0 if require_ema21_up else True
+    dx = ( (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan) ) * 100
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+
+    return adx.fillna(method="bfill").fillna(0.0)
+
+
+def _ensure_rsi(df: pd.DataFrame, rsi_col: str = "rsi", period: int = 14) -> pd.DataFrame:
+    """
+    If RSI already exists (from strategy), keep it; otherwise compute a simple RSI(14).
+    """
+    if rsi_col in df.columns:
+        return df
+
+    close = df["close"].astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    df[rsi_col] = rsi.fillna(method="bfill").fillna(50.0)
+    return df
+
+
+def attach_verifiers(df: pd.DataFrame, cfg: Dict, ema_fast_col: str = "ema_fast", ema_slow_col: str = "ema_slow") -> pd.DataFrame:
+    """
+    Enriches the dataframe with helper columns used by long_ok():
+      - adx (float)
+      - ema_slope_pct (float) : pct change of ema_fast
+      - rsi (float) : if not already present
+      - verifier booleans are computed in long_ok() using cfg thresholds
+
+    Config keys (under cfg['filters']):
+      adx_period: int (default 14)
+      adx_threshold: float (default 25.0)  # stricter trend filter
+      rsi_period: int (default 14)
+      rsi_min: float | None
+      rsi_max: float | None
+      slope_threshold_pct: float | None (e.g., 0.0012 for +0.12% per bar)
+      min_price: float | None (e.g., 5.0)  # avoid penny stocks
+      min_dollar_vol: float | None (e.g., 5_000_000)  # avg(close*volume) over window
+      dollar_vol_window: int (default 20)
+    """
+    fcfg = dict(cfg.get("filters", {}))
+
+    # --- ADX ---
+    adx_period = int(fcfg.get("adx_period", 14))
+    if "adx" not in df.columns:
+        df["adx"] = _compute_adx(df, period=adx_period)
+
+    # --- RSI ---
+    rsi_period = int(fcfg.get("rsi_period", 14))
+    df = _ensure_rsi(df, rsi_col="rsi", period=rsi_period)
+
+    # --- EMA slope pct (based on fast EMA) ---
+    if ema_fast_col in df.columns:
+        df["ema_slope_pct"] = df[ema_fast_col].pct_change().fillna(0.0)
     else:
-        thr = float(fcfg.get("slope_threshold_pct", 0.0012))
-        fast_ok = float(row.get("ema_fast_slope_pct", 0.0)) >= thr
-        slow_ok = float(row.get("ema_slow_slope_pct", 0.0)) > 0.0 if require_ema21_up else True
-    if not (fast_ok and slow_ok):
+        df["ema_slope_pct"] = 0.0
+
+    # --- Dollar volume (rolling) to avoid illiquid / choppy names ---
+    min_dv = fcfg.get("min_dollar_vol")
+    if min_dv is not None:
+        win = int(fcfg.get("dollar_vol_window", 20))
+        dv = (df["close"].astype(float) * df["volume"].astype(float)).rolling(win).mean()
+        df["dollar_vol_avg"] = dv.fillna(0.0)
+    else:
+        if "dollar_vol_avg" not in df.columns:
+            df["dollar_vol_avg"] = 0.0
+
+    return df
+
+
+def long_ok(row: pd.Series, cfg: Dict, ema_fast_col: str = "ema_fast", ema_slow_col: str = "ema_slow") -> bool:
+    """
+    Combines verifiers into a single long-entry gate.
+    Reads thresholds from cfg['filters'] with sensible defaults.
+    """
+    fcfg = dict(cfg.get("filters", {}))
+
+    # --- ADX trend strength ---
+    adx_th = float(fcfg.get("adx_threshold", 25.0))  # stricter default
+    if float(row.get("adx", 0.0)) < adx_th:
         return False
 
-    # Optional separation
-    sep_bps = float(fcfg.get("ema_separation_bps", 0.0))
-    if sep_bps > 0:
-        fast = float(row.get(ema_fast_col, 0.0))
-        slow = float(row.get(ema_slow_col, 0.0))
-        if slow != 0:
-            sep = abs(fast - slow) / abs(slow)
-            if sep < (sep_bps / 10000.0):
-                return False
+    # --- RSI bounds (optional) ---
+    rsi_min = fcfg.get("rsi_min", None)
+    rsi_max = fcfg.get("rsi_max", None)
+    rsi_val = float(row.get("rsi", 50.0))
+    if rsi_min is not None and rsi_val < float(rsi_min):
+        return False
+    if rsi_max is not None and rsi_val > float(rsi_max):
+        return False
+
+    # --- Positive EMA slope (optional threshold) ---
+    slope_th = fcfg.get("slope_threshold_pct", None)
+    slope_val = float(row.get("ema_slope_pct", 0.0))
+    if slope_th is not None and slope_val < float(slope_th):
+        return False
+
+    # --- Avoid penny / illiquid (optional) ---
+    min_price = fcfg.get("min_price", None)
+    if min_price is not None and float(row.get("close", 0.0)) < float(min_price):
+        return False
+
+    min_dv = fcfg.get("min_dollar_vol", None)
+    if min_dv is not None and float(row.get("dollar_vol_avg", 0.0)) < float(min_dv):
+        return False
 
     return True
