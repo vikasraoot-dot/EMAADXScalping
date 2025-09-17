@@ -1,47 +1,23 @@
-name: EMA Live Paper (AM loop, self-hosted Windows)
+name: EMA Live Paper (loop AM)
 
 on:
-  workflow_dispatch:
-    inputs:
-      tickers:
-        description: "Comma-separated symbols (blank = EMAMerged/tickers.txt)"
-        required: false
-        default: ""
-      dry_run:
-        description: "1=log only, 0=live"
-        required: false
-        default: "1"
-      force_run:
-        description: "1=bypass market-hours gate"
-        required: false
-        default: "0"
-      adx:
-        description: "Override ADX threshold (blank=default)"
-        required: false
-        default: ""
-      rsi_min:
-        description: "Override RSI min (blank=default)"
-        required: false
-        default: ""
-      rsi_max:
-        description: "Override RSI max (blank=default)"
-        required: false
-        default: ""
-      slope_pct:
-        description: "Override EMA9 slope pct (e.g. 0.0012)"
-        required: false
-        default: ""
-  # Cron is UTC; 13–20 ≈ 9:00–4:59 ET during DST
   schedule:
-    - cron: "*/5 13-21 * * 1-5"
+    # 13:15 UTC ≈ 9:15 ET during DST. GitHub cron is always UTC.
+    - cron: "15 13 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: ema-live-paper-loop-am
+  cancel-in-progress: true
 
 jobs:
-  live:
-    runs-on: [self-hosted, windows]
-    timeout-minutes: 15
+  trade:
+    runs-on: [self-hosted, windows]   # local Windows runner
+    timeout-minutes: 360              # ~6h window
     defaults:
       run:
         shell: powershell
+
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +36,8 @@ jobs:
           & "$env:PYTHON_EXE" -m pip install -r EMAMerged/requirements.txt
 
       - name: Set PYTHONPATH
-        run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+        run: |
+          echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
 
       - name: Force UTF-8 (PowerShell + Python)
         run: |
@@ -79,45 +56,20 @@ jobs:
           echo "APCA_API_BASE_URL=$val" >> $env:GITHUB_ENV
           Write-Host "Using Alpaca URL: $val"
 
-      - name: Run live loop once
+      - name: Start AM session loop
         env:
           # Alpaca creds
           ALPACA_API_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
 
-          # Optional filter overrides
-          FILTER_ADX:        ${{ github.event.inputs.adx }}
-          FILTER_RSI_MIN:    ${{ github.event.inputs.rsi_min }}
-          FILTER_RSI_MAX:    ${{ github.event.inputs.rsi_max }}
-          FILTER_SLOPE_PCT:  ${{ github.event.inputs.slope_pct }}
+          # Control flags for the one-shot script it calls
+          DRY_RUN:  "1"   # set to "0" to go live
+          FORCE_RUN: "0"  # the outer loop already gates on RTH
 
-          # Control flags
-          DRY_RUN:           ${{ github.event.inputs.dry_run }}
-          FORCE_RUN:         ${{ github.event.inputs.force_run }}
+          # (Optional) override & debugging
+          # SYMBOLS: "AAPL,MSFT"      # uncomment to override tickers file
+          # FAST_LOOP: "1"            # wakes every 1s for quick debug
 
-          # Live log streaming
-          PYTHONUNBUFFERED:  "1"
+          PYTHONUNBUFFERED: "1"   # stream logs live
         run: |
-          # Resolve symbols from input or fallback file and normalize
-          $syms = "${{ github.event.inputs.tickers }}".Trim()
-          if (-not $syms) {
-            if (Test-Path "EMAMerged/tickers.txt") {
-              $syms = (Get-Content "EMAMerged/tickers.txt" -Raw)
-            }
-          }
-          $list = $syms -split '[\s,]+' | Where-Object { $_ -ne "" } | Select-Object -Unique
-          $symbols = ($list -join ',')
-
-          if ([string]::IsNullOrWhiteSpace($symbols)) {
-            & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/live_paper_loop.py `
-              --config EMAMerged/config.yaml `
-              --tickers EMAMerged/tickers.txt `
-              --dry-run $env:DRY_RUN `
-              --force-run $env:FORCE_RUN
-          } else {
-            & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/live_paper_loop.py `
-              --config EMAMerged/config.yaml `
-              --symbols "$symbols" `
-              --dry-run $env:DRY_RUN `
-              --force-run $env:FORCE_RUN
-          }
+          & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/market_loop.py
