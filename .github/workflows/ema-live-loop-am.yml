@@ -13,7 +13,7 @@ concurrency:
 jobs:
   trade:
     runs-on: [self-hosted, windows]   # local Windows runner
-    timeout-minutes: 360              # ~6h window
+    timeout-minutes: 420              # ~6h window
     defaults:
       run:
         shell: powershell
