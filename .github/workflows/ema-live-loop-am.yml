@@ -3,7 +3,7 @@ name: EMA Live Paper (loop AM)
 on:
   schedule:
     # 13:15 UTC ≈ 9:15 ET during DST. GitHub cron is always UTC.
-    - cron: "*/1 * * * *"
+    - cron: "00 13 * * 1-5"
   workflow_dispatch:
 
 concurrency:
