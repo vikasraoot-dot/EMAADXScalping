@@ -52,7 +52,7 @@ MCD
 MDT
 MET
 META
-MGM (optional)
+MGM
 MMM
 MRK
 MS
@@ -73,7 +73,7 @@ SBUX
 SO
 SPG
 T
-TAK (optional)
+TAK
 TGT
 TMUS
 TSLA
