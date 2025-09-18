@@ -75,13 +75,16 @@ def load_bars_for_symbol(
     df = drop_unclosed_last_bar(df, timeframe=tf)
     return df
 
-def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_per_trade=0.01):
+def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_per_trade=0.01, trades_sink=None):
     """
     Simple, deterministic long-only backtest:
     - Entry: previous bar signals cross==1 AND long_ok(prev, cfg) → enter at next bar OPEN.
     - Exit:  cross==-1 on previous bar → exit next OPEN
              plus bracket-style ATR SL/TP if present in cfg['brackets'].
     - Sizing: risk% of equity, risk-per-share = max(ATR, 1% of price).
+
+    trades_sink: optional list to append dicts:
+      {"entry_ts", "entry_px", "exit_ts", "exit_px", "pnl"}
     """
     if df is None or df.empty or len(df) < 30:
         return dict(trades=0, gross=0.0, net=0.0, win_rate=0.0, ret_pct=0.0, equity=start_cash)
@@ -102,6 +105,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
     in_pos = False
     qty = 0
     entry_px = 0.0
+    entry_ts = None
     r_per_sh = 0.0
     wins = 0
     losses = 0
@@ -115,6 +119,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
     for i in range(1, len(df)):
         prev = df.iloc[i-1]
         cur = df.iloc[i]
+        cur_ts = cur.name
         open_px = float(cur["open"])
 
         if not in_pos:
@@ -128,6 +133,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
                 qty = max(int(risk_dollars / base_r), 1)
                 r_per_sh = base_r
                 entry_px = open_px
+                entry_ts = cur_ts
                 in_pos = True
         else:
             # default exit on cross down (prev bar)
@@ -140,25 +146,49 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
                 tp_px   = entry_px + take_profit_r * r_per_sh
                 hit_sl = cur["low"]  <= stop_px
                 hit_tp = cur["high"] >= tp_px
-                if hit_sl:
-                    pnl = (stop_px - entry_px) * qty
+                if hit_sl or hit_tp:
+                    exit_px = stop_px if hit_sl else tp_px
+                    pnl = (exit_px - entry_px) * qty
                     equity += pnl; gross += pnl
-                    losses += 1 if pnl <= 0 else 0
-                    in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0
-                    continue
-                if hit_tp:
-                    pnl = (tp_px - entry_px) * qty
-                    equity += pnl; gross += pnl
-                    wins += 1 if pnl > 0 else 0
-                    in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0
+                    if pnl > 0: wins += 1
+                    else:       losses += 1
+                    if trades_sink is not None:
+                        trades_sink.append({
+                            "entry_ts": entry_ts, "entry_px": entry_px,
+                            "exit_ts": cur_ts,   "exit_px": exit_px,
+                            "pnl": round(pnl, 2)
+                        })
+                    in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0; entry_ts = None
                     continue
 
             if exit_now:
-                pnl = (open_px - entry_px) * qty
+                exit_px = open_px
+                pnl = (exit_px - entry_px) * qty
                 equity += pnl; gross += pnl
                 if pnl > 0: wins += 1
                 else:       losses += 1
-                in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0
+                if trades_sink is not None:
+                    trades_sink.append({
+                        "entry_ts": entry_ts, "entry_px": entry_px,
+                        "exit_ts": cur_ts,    "exit_px": exit_px,
+                        "pnl": round(pnl, 2)
+                    })
+                in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0; entry_ts = None
+
+    # If an open trade remains, close at last bar close for accounting
+    if in_pos and entry_ts is not None:
+        last = df.iloc[-1]
+        exit_px = float(last["close"])
+        pnl = (exit_px - entry_px) * qty
+        equity += pnl; gross += pnl
+        if pnl > 0: wins += 1
+        else:       losses += 1
+        if trades_sink is not None:
+            trades_sink.append({
+                "entry_ts": entry_ts, "entry_px": entry_px,
+                "exit_ts": last.name, "exit_px": exit_px,
+                "pnl": round(pnl, 2)
+            })
 
     trades = wins + losses
     ret_pct = (equity / start_cash - 1.0) * 100.0
@@ -225,9 +255,30 @@ def main():
         pct_adx = (di["adx"] >= adx_th).mean() * 100.0 if "adx" in di.columns else 0.0
         print(f"[{sym}] bars={bars}, crosses_up={crosses_up}, %ADX>={adx_th:.0f}={pct_adx:.1f}%")
 
-        # --- Backtest simulation ---
-        res = simulate_long_only(df, cfg, start_cash=args.cash, risk_per_trade=args.risk)
+        # --- Backtest simulation + capture trade dates ---
+        trades = []
+        res = simulate_long_only(
+            df, cfg,
+            start_cash=args.cash,
+            risk_per_trade=args.risk,
+            trades_sink=trades
+        )
         rows.append({"symbol": sym, **res})
+
+        # Pretty-print the trade dates for this symbol (if any)
+        if trades:
+            print(f"  TRADES {sym}:")
+            for t in trades:
+                ent_ts, exi_ts = t["entry_ts"], t["exit_ts"]
+                # best-effort ET formatting if tz-aware:
+                try:
+                    if hasattr(ent_ts, "tzinfo") and ent_ts.tzinfo:
+                        ent_ts = ent_ts.tz_convert("US/Eastern")
+                    if hasattr(exi_ts, "tzinfo") and exi_ts.tzinfo:
+                        exi_ts = exi_ts.tz_convert("US/Eastern")
+                except Exception:
+                    pass
+                print(f"    ENTRY {ent_ts} @ {t['entry_px']:.2f}  →  EXIT {exi_ts} @ {t['exit_px']:.2f}  PnL={t['pnl']:.2f}")
 
     if not rows:
         print("No results.")
