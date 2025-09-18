@@ -16,9 +16,11 @@ from EMAMerged.src.data import (
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok
 
+
 def _env(name: str, default: str = "") -> str:
     v = os.environ.get(name)
     return v if v is not None else default
+
 
 def _alpaca_creds():
     key = _env("ALPACA_API_KEY") or _env("ALPACA_KEY")
@@ -27,6 +29,7 @@ def _alpaca_creds():
     if not key or not secret:
         raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
     return base, key, secret
+
 
 def load_bars_for_symbol(
     sym: str,
@@ -75,16 +78,14 @@ def load_bars_for_symbol(
     df = drop_unclosed_last_bar(df, timeframe=tf)
     return df
 
-def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_per_trade=0.01, trades_sink=None):
+
+def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0):
     """
-    Simple, deterministic long-only backtest:
-    - Entry: previous bar signals cross==1 AND long_ok(prev, cfg) → enter at next bar OPEN.
+    Fixed-quantity (qty=1) long-only backtest:
+    - Entry: previous bar signals cross==1 AND long_ok(prev, cfg) → enter at next bar OPEN with qty=1.
     - Exit:  cross==-1 on previous bar → exit next OPEN
              plus bracket-style ATR SL/TP if present in cfg['brackets'].
-    - Sizing: risk% of equity, risk-per-share = max(ATR, 1% of price).
-
-    trades_sink: optional list to append dicts:
-      {"entry_ts", "entry_px", "exit_ts", "exit_px", "pnl"}
+    - No risk sizing; quantity is always 1 share.
     """
     if df is None or df.empty or len(df) < 30:
         return dict(trades=0, gross=0.0, net=0.0, win_rate=0.0, ret_pct=0.0, equity=start_cash)
@@ -92,7 +93,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
     # Build indicators exactly like live (adds ema_fast/slow, atr, rsi, adx, etc.)
     df = compute_indicators(df, cfg).copy()
 
-    # Ensure ATR exists for sizing/SL
+    # Ensure ATR exists for bracket distances
     if "atr" not in df.columns:
         tr = pd.concat([
             df["high"] - df["low"],
@@ -105,96 +106,84 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pe
     in_pos = False
     qty = 0
     entry_px = 0.0
-    entry_ts = None
-    r_per_sh = 0.0
+
     wins = 0
     losses = 0
     gross = 0.0
 
+    # Bracket/exit params (same meaning as live config)
     bcfg = cfg.get("brackets", {})
     atr_mult_sl = float(bcfg.get("atr_mult_sl", 1.2))
     take_profit_r = float(bcfg.get("take_profit_r", 1.0))
-    min_r_pct = 0.01  # fallback = 1% of price
 
+    trades_printed = []  # (entry_ts, entry_px, exit_ts, exit_px, pnl)
+
+    # We will use ATR as the "R" base for brackets
     for i in range(1, len(df)):
-        prev = df.iloc[i-1]
+        prev = df.iloc[i - 1]
         cur = df.iloc[i]
-        cur_ts = cur.name
         open_px = float(cur["open"])
 
         if not in_pos:
-            # entry signal formed on prev bar close → act at next open
+            # Signal formed on prev bar close → act at next open with qty=1
             x = crossover(df.iloc[:i])  # history up to prev bar
             if x == 1 and long_ok(prev, cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow"):
-                risk_dollars = equity * risk_per_trade
-                base_r = max(float(prev.get("atr", 0.0)), float(prev["close"]) * min_r_pct)
-                if base_r <= 0:
-                    continue
-                qty = max(int(risk_dollars / base_r), 1)
-                r_per_sh = base_r
+                qty = 1
                 entry_px = open_px
-                entry_ts = cur_ts
                 in_pos = True
+                entry_ts = cur.name  # timestamp of the bar we enter at (next bar open)
         else:
-            # default exit on cross down (prev bar)
+            # Default exit on cross down (prev bar)
             x = crossover(df.iloc[:i])
-            exit_now = (x == -1)
+            exit_now_on_cross = (x == -1)
 
-            # bracket-style exits on current bar range
-            if r_per_sh > 0:
-                stop_px = max(0.01, entry_px - atr_mult_sl * r_per_sh)
-                tp_px   = entry_px + take_profit_r * r_per_sh
-                hit_sl = cur["low"]  <= stop_px
-                hit_tp = cur["high"] >= tp_px
-                if hit_sl or hit_tp:
-                    exit_px = stop_px if hit_sl else tp_px
-                    pnl = (exit_px - entry_px) * qty
-                    equity += pnl; gross += pnl
-                    if pnl > 0: wins += 1
-                    else:       losses += 1
-                    if trades_sink is not None:
-                        trades_sink.append({
-                            "entry_ts": entry_ts, "entry_px": entry_px,
-                            "exit_ts": cur_ts,   "exit_px": exit_px,
-                            "pnl": round(pnl, 2)
-                        })
-                    in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0; entry_ts = None
-                    continue
+            # Bracket-style exits on current bar range using ATR as R
+            atr_val = float(prev.get("atr", 0.0)) if "atr" in df.columns else 0.0
+            stop_px = max(0.01, entry_px - atr_mult_sl * atr_val) if atr_val > 0 else None
+            tp_px   = (entry_px + take_profit_r * atr_val) if atr_val > 0 else None
 
-            if exit_now:
+            # Check SL/TP intrabar
+            hit_sl = (stop_px is not None) and (cur["low"]  <= stop_px)
+            hit_tp = (tp_px   is not None) and (cur["high"] >= tp_px)
+
+            if hit_sl:
+                exit_px = stop_px
+                pnl = (exit_px - entry_px) * qty
+                equity += pnl; gross += pnl
+                losses += 1 if pnl <= 0 else 0
+                in_pos = False; qty = 0
+                trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
+                continue
+
+            if hit_tp:
+                exit_px = tp_px
+                pnl = (exit_px - entry_px) * qty
+                equity += pnl; gross += pnl
+                wins += 1 if pnl > 0 else 0
+                in_pos = False; qty = 0
+                trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
+                continue
+
+            if exit_now_on_cross:
                 exit_px = open_px
                 pnl = (exit_px - entry_px) * qty
                 equity += pnl; gross += pnl
                 if pnl > 0: wins += 1
                 else:       losses += 1
-                if trades_sink is not None:
-                    trades_sink.append({
-                        "entry_ts": entry_ts, "entry_px": entry_px,
-                        "exit_ts": cur_ts,    "exit_px": exit_px,
-                        "pnl": round(pnl, 2)
-                    })
-                in_pos = False; qty = 0; r_per_sh = 0.0; entry_px = 0.0; entry_ts = None
+                in_pos = False; qty = 0
+                trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
 
-    # If an open trade remains, close at last bar close for accounting
-    if in_pos and entry_ts is not None:
-        last = df.iloc[-1]
-        exit_px = float(last["close"])
-        pnl = (exit_px - entry_px) * qty
-        equity += pnl; gross += pnl
-        if pnl > 0: wins += 1
-        else:       losses += 1
-        if trades_sink is not None:
-            trades_sink.append({
-                "entry_ts": entry_ts, "entry_px": entry_px,
-                "exit_ts": last.name, "exit_px": exit_px,
-                "pnl": round(pnl, 2)
-            })
+    # Print the collected trades for this symbol (caller prints header)
+    for (ent_ts, ent_px, ex_ts, ex_px, pnl) in trades_printed:
+        # pandas index is tz-aware; print as ET-like string (kept as .isoformat for clarity)
+        print(f"    ENTRY {ent_ts} @ {ent_px:.2f}  →  EXIT {ex_ts} @ {ex_px:.2f}  qty=1  PnL={pnl:.2f}")
 
     trades = wins + losses
     ret_pct = (equity / start_cash - 1.0) * 100.0
     win_rate = (wins / trades * 100.0) if trades > 0 else 0.0
-    return dict(trades=trades, gross=round(gross,2), net=round(gross,2),
-                win_rate=round(win_rate,1), ret_pct=round(ret_pct,2), equity=round(equity,2))
+    return dict(trades=trades, gross=round(gross, 2), net=round(gross, 2),
+                win_rate=round(win_rate, 1), ret_pct=round(ret_pct, 2), equity=round(equity, 2))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -203,7 +192,8 @@ def main():
     ap.add_argument("--symbols", default="")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--cash", type=float, default=10_000)
-    ap.add_argument("--risk", type=float, default=0.01)
+    # NOTE: risk argument kept for backward compatibility but IGNORED (qty is fixed to 1)
+    ap.add_argument("--risk", type=float, default=0.01, help="Ignored: backtest uses fixed qty=1")
     # Backtest-only overrides:
     ap.add_argument("--timeframe", default=None, help="Override timeframe for backtest (e.g., 15Min)")
     ap.add_argument("--limit", type=int, default=None, help="Override bar_limit for backtest (e.g., 10000)")
@@ -242,7 +232,6 @@ def main():
             print(f"[{sym}] bars=0")
             continue
 
-        # Build indicators for diagnostics only (won't recompute twice for simulate since we pass df raw)
         di = compute_indicators(df, cfg).copy()
         bars = len(di)
 
@@ -255,30 +244,11 @@ def main():
         pct_adx = (di["adx"] >= adx_th).mean() * 100.0 if "adx" in di.columns else 0.0
         print(f"[{sym}] bars={bars}, crosses_up={crosses_up}, %ADX>={adx_th:.0f}={pct_adx:.1f}%")
 
-        # --- Backtest simulation + capture trade dates ---
-        trades = []
-        res = simulate_long_only(
-            df, cfg,
-            start_cash=args.cash,
-            risk_per_trade=args.risk,
-            trades_sink=trades
-        )
+        # --- Backtest simulation (qty=1 model) ---
+        # Print header if any trade gets printed inside simulate_long_only
+        print(f"  TRADES {sym}:")
+        res = simulate_long_only(df, cfg, start_cash=args.cash)
         rows.append({"symbol": sym, **res})
-
-        # Pretty-print the trade dates for this symbol (if any)
-        if trades:
-            print(f"  TRADES {sym}:")
-            for t in trades:
-                ent_ts, exi_ts = t["entry_ts"], t["exit_ts"]
-                # best-effort ET formatting if tz-aware:
-                try:
-                    if hasattr(ent_ts, "tzinfo") and ent_ts.tzinfo:
-                        ent_ts = ent_ts.tz_convert("US/Eastern")
-                    if hasattr(exi_ts, "tzinfo") and exi_ts.tzinfo:
-                        exi_ts = exi_ts.tz_convert("US/Eastern")
-                except Exception:
-                    pass
-                print(f"    ENTRY {ent_ts} @ {t['entry_px']:.2f}  →  EXIT {exi_ts} @ {t['exit_px']:.2f}  PnL={t['pnl']:.2f}")
 
     if not rows:
         print("No results.")
@@ -297,6 +267,7 @@ def main():
     print("\nTOTAL  trades={}  net={}  win_rate={}%%  avg_ret={}%%  equity_sum={}".format(
         total_trades, total_net, avg_winrate, avg_ret, total_equity
     ))
+
 
 if __name__ == "__main__":
     main()
