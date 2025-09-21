@@ -1,27 +1,56 @@
-timeframe: "15Min"
+# === EMAMerged/config.yaml ===
+
+# SESSION / DATA
+timezone: "US/Eastern"
+rth_only: true
+rth_start: "09:30"
+rth_end:   "15:55"
+
+# Live cadence as requested
+timeframe: "5Min"
 history_days: 30
-bar_limit: 10000
+bar_limit: 500
 feed: "iex"
 
+# Optional entry windows inside RTH (can remove if you want full RTH)
+entry_windows:
+  - { start: "09:35", end: "12:00" }
+  - { start: "13:00", end: "15:45" }
+
+# Block NEW entries N minutes before close
+no_new_entries_last_min: 10
+
+# CORE STRATEGY PARAMETERS
+ema_fast: 9
+ema_slow: 21
+atr_period: 14
+
+# FILTERS (all must pass to enter long)
 filters:
-  # STRONGER TREND
+  # ADX / DI
   adx_period: 14
-  adx_threshold: 23        # ↑ stricter than typical 20-22
-
-  # MOMENTUM BOUNDS (optional)
+  adx_threshold: 23           # you had 23 in your current config; say the word if you want 22
+  # RSI
   rsi_period: 14
-  rsi_min: 45              # example; set to null / remove to disable
+  rsi_min: 50                 # was 45; raise/lower to taste (can override via dispatch)
   rsi_max: 80
-
-  # POSITIVE SLOPE (optional)
-  slope_threshold_pct: 0.0012   # +0.12% per bar; raise to be stricter
-
-  # AVOID PENNIES / ILLIQUID (optional)
+  # EMA slope (percent-of-price)
+  slope_threshold_pct: 0.0012 # 12 bps per bar
+  # Optional quality gates
   min_price: 10.0
-  min_dollar_vol: 5000000       # $5M average over the window
+  min_dollar_vol: 5000000
   dollar_vol_window: 20
 
+# POSITION / RISK
+allow_shorts: false
+qty: 1                        # ALWAYS 1 share per entry
+max_notional_per_trade: 2000  # skip entry when price > $2,000
+
+# BRACKET ORDERS
 brackets:
   enabled: true
-  atr_mult_sl: 1.0        # tighter stop than 1.2 (more defensive)
-  take_profit_r: 1.2      # optional: increase TP to 1.2R if you tighten SL
+  atr_mult_sl: 1.2            # stop distance = 1.2 * ATR
+  take_profit_r: 1.0          # TP at +1R (R = entry price − stop price)
+
+# OUTPUT
+results_dir: "results"
