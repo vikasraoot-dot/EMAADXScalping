@@ -7,15 +7,11 @@ rth_start: "09:30"
 rth_end:   "15:55"
 
 # Live cadence as requested
-timeframe: "5Min"
+timeframe: "15Min"
 history_days: 30
-bar_limit: 500
+bar_limit: 10000
 feed: "iex"
 
-# Optional entry windows inside RTH (can remove if you want full RTH)
-entry_windows:
-  - { start: "09:35", end: "12:00" }
-  - { start: "13:00", end: "15:45" }
 
 # Block NEW entries N minutes before close
 no_new_entries_last_min: 10
@@ -49,8 +45,8 @@ max_notional_per_trade: 2000  # skip entry when price > $2,000
 # BRACKET ORDERS
 brackets:
   enabled: true
-  atr_mult_sl: 1.2            # stop distance = 1.2 * ATR
-  take_profit_r: 1.0          # TP at +1R (R = entry price − stop price)
+  atr_mult_sl: 1.0            # stop distance = 1.2 * ATR
+  take_profit_r: 1.2          # TP at +1R (R = entry price − stop price)
 
 # OUTPUT
 results_dir: "results"
