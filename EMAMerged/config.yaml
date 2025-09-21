@@ -32,7 +32,7 @@ filters:
   adx_threshold: 23           # you had 23 in your current config; say the word if you want 22
   # RSI
   rsi_period: 14
-  rsi_min: 50                 # was 45; raise/lower to taste (can override via dispatch)
+  rsi_min: 45                 # was 45; raise/lower to taste (can override via dispatch)
   rsi_max: 80
   # EMA slope (percent-of-price)
   slope_threshold_pct: 0.0012 # 12 bps per bar
