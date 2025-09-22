@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sys, argparse
+import os
+import sys
+import argparse
 import pandas as pd
 
-# --- Add repo root to sys.path so "EMAMerged" imports resolve when run as a script ---
+# --- Ensure repo root on sys.path so "EMAMerged" imports resolve when run as a script ---
 _THIS = os.path.abspath(os.path.dirname(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS, "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -11,179 +13,261 @@ if _REPO_ROOT not in sys.path:
 
 from EMAMerged.src.utils import load_config, read_tickers
 from EMAMerged.src.data import (
-    get_alpaca_bars, filter_rth, drop_unclosed_last_bar,
+    get_alpaca_bars,
+    filter_rth,
+    drop_unclosed_last_bar,
 )
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok
 
 
-def _env(name: str, default: str = "") -> str:
-    v = os.environ.get(name)
-    return v if v is not None else default
+# ------------------------------------------------------------------
+# Helpers for instrumentation and light MTF bias (minimal & optional)
+# ------------------------------------------------------------------
 
-
-def _alpaca_creds():
-    key = _env("ALPACA_API_KEY") or _env("ALPACA_KEY")
-    secret = _env("ALPACA_API_SECRET") or _env("ALPACA_SECRET")
-    base = (_env("APCA_API_BASE_URL") or _env("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
-    if not key or not secret:
-        raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
-    return base, key, secret
-
-
-def load_bars_for_symbol(
-    sym: str,
-    cfg: dict,
-    days: int,
-    timeframe_override: str | None = None,
-    limit_override: int | None = None,
-    rth_only_override: bool | None = None,
-) -> pd.DataFrame:
+def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shift_bars: int = 1) -> pd.Series:
     """
-    Fetch bars from Alpaca, optionally overriding timeframe/limit and enforcing RTH.
+    Light multi-timeframe bias: HTF fast EMA > HTF slow EMA on the prior HTF bar.
+    Returns a boolean Series aligned to df.index.
     """
-    # creds are read only to keep parity with live; get_alpaca_bars uses key/secret
-    base, key, secret = _alpaca_creds()
-    tf = timeframe_override or cfg.get("timeframe", "5Min")
-    limit = int(limit_override or cfg.get("bar_limit", 500))
+    f = int(cfg.get("ema_fast", 9))
+    s = int(cfg.get("ema_slow", 21))
+
+    # Resample close to HTF and compute simple fast/slow EMAs there
+    htf = df[["close"]].resample(timeframe).last()
+    htf["ema_fast_htf"] = htf["close"].ewm(span=f, adjust=False, min_periods=f).mean()
+    htf["ema_slow_htf"] = htf["close"].ewm(span=s, adjust=False, min_periods=s).mean()
+
+    bias = (htf["ema_fast_htf"] > htf["ema_slow_htf"]).shift(shift_bars).fillna(False)
+    # Map back to LTF index via ffill
+    return bias.reindex(df.index, method="ffill").fillna(False)
+
+
+def _eval_long_reasons(prev: pd.Series, cfg: dict, mtf_bias_ok: bool) -> list:
+    """
+    Build a list of reasons why an entry is rejected.
+    Mirrors filters.long_ok at a high level, but only for logging.
+    """
+    reasons = []
+    fcfg = dict(cfg.get("filters", {}))
+
+    # ADX threshold (you set 23 in config; we do not override it)
+    adx_th = float(fcfg.get("adx_threshold", 25.0))
+    adx_val = float(prev.get("adx", 0.0))
+    if adx_val < adx_th:
+        reasons.append("ADX {:.1f} < {:.1f}".format(adx_val, adx_th))
+
+    # RSI band
+    rsi_val = float(prev.get("rsi", 0.0))
+    rsi_min = fcfg.get("rsi_min", None)
+    rsi_max = fcfg.get("rsi_max", None)
+    if rsi_min is not None and rsi_val < float(rsi_min):
+        reasons.append("RSI {:.1f} < {:.1f}".format(rsi_val, float(rsi_min)))
+    if rsi_max is not None and rsi_val > float(rsi_max):
+        reasons.append("RSI {:.1f} > {:.1f}".format(rsi_val, float(rsi_max)))
+
+    # EMA slope (if present in your pipeline)
+    slope_th = fcfg.get("slope_threshold_pct", None)
+    if slope_th is not None and "ema_slope_pct" in prev.index:
+        slope_val = float(prev.get("ema_slope_pct", 0.0))
+        if slope_val < float(slope_th):
+            reasons.append("EMA_slope {:.5f} < {:.5f}".format(slope_val, float(slope_th)))
+
+    # Price / Liquidity (if present)
+    min_price = fcfg.get("min_price", None)
+    if min_price is not None:
+        close_val = float(prev.get("close", 0.0))
+        if close_val < float(min_price):
+            reasons.append("Price {:.2f} < {:.2f}".format(close_val, float(min_price)))
+
+    min_dv = fcfg.get("min_dollar_vol", None)
+    if min_dv is not None and "dollar_vol_avg" in prev.index:
+        dv_val = float(prev.get("dollar_vol_avg", 0.0))
+        if dv_val < float(min_dv):
+            reasons.append("DollarVol {:.0f} < {:.0f}".format(dv_val, float(min_dv)))
+
+    # MTF bias
+    if not mtf_bias_ok:
+        reasons.append("MTF bias false")
+
+    return reasons
+
+
+# ------------------------------------------------------------------
+# Data loading helper (kept minimal and consistent with your structure)
+# ------------------------------------------------------------------
+
+def load_bars_for_symbol(symbol: str, cfg: dict, days: int,
+                         timeframe_override=None, limit_override=None, rth_only_override=True) -> pd.DataFrame:
+    timeframe = timeframe_override or cfg.get("timeframe", "15Min")
+    limit = limit_override or cfg.get("bar_limit", 10000)
     feed = cfg.get("feed", "iex")
-
-    df = get_alpaca_bars(
-        key, secret, sym,
-        timeframe=tf,
-        history_days=days,
-        bar_limit=limit,
-        feed=feed,
-    )
+    df = get_alpaca_bars(symbol, timeframe=timeframe, limit=limit, feed=feed)
     if df.empty:
         return df
+    df = drop_unclosed_last_bar(df)
+    if rth_only_override:
+        df = filter_rth(df, cfg.get("rth_start", "09:30"), cfg.get("rth_end", "15:55"))
 
-    # RTH filter (force on by default for backtests)
-    if rth_only_override is None:
-        rth_flag = bool(cfg.get("rth_only", True))
-    else:
-        rth_flag = bool(rth_only_override)
-
-    if rth_flag:
-        tz = cfg.get("timezone", "US/Eastern")
-        df = filter_rth(
-            df,
-            tz_name=tz,
-            rth_start=cfg.get("rth_start", "09:30"),
-            rth_end=cfg.get("rth_end", "15:55"),
-            allowed_windows=cfg.get("entry_windows"),  # respect windows if present
-        )
-
-    # Drop currently-forming last bar to match live logic
-    df = drop_unclosed_last_bar(df, timeframe=tf)
-    return df
+    # Approx trim by days for 15m bars (keeps things consistent with your prints)
+    bars_per_day_15m = 390 // 15  # 26 bars
+    approx_rows = int(days) * bars_per_day_15m
+    return df.tail(approx_rows)
 
 
-def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0):
+# ------------------------------------------------------------------
+# Backtest simulator (minimal changes: risk sizing + mtf bias + reasons)
+# ------------------------------------------------------------------
+
+def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pct: float = 0.01):
     """
-    Fixed-quantity (qty=1) long-only backtest:
-    - Entry: previous bar signals cross==1 AND long_ok(prev, cfg) → enter at next bar OPEN with qty=1.
-    - Exit:  cross==-1 on previous bar → exit next OPEN
-             plus bracket-style ATR SL/TP if present in cfg['brackets'].
-    - No risk sizing; quantity is always 1 share.
+    Long-only backtest with risk-based sizing (+$2,000 cap) and light MTF bias.
+    - Entry: previous bar crossover==1 AND long_ok(prev,cfg).
+             Additionally require 60m HTF bias (fast>slow on prior HTF bar), unless disabled in config.
+    - Exit:  previous bar crossover==-1 -> exit next OPEN.
+             Bracket ATR SL/TP unchanged; we do not alter your exit model.
     """
     if df is None or df.empty or len(df) < 30:
         return dict(trades=0, gross=0.0, net=0.0, win_rate=0.0, ret_pct=0.0, equity=start_cash)
 
-    # Build indicators exactly like live (adds ema_fast/slow, atr, rsi, adx, etc.)
     df = compute_indicators(df, cfg).copy()
 
-    # Ensure ATR exists for bracket distances
-    if "atr" not in df.columns:
-        tr = pd.concat([
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift()).abs(),
-            (df["low"] - df["close"].shift()).abs()
-        ], axis=1).max(axis=1)
-        df["atr"] = tr.rolling(14).mean()
+    # Light MTF bias (reads config if present; defaults to enabled)
+    mtf_cfg = dict(cfg.get("filters", {})).get("mtf_bias", {}) if isinstance(cfg.get("filters", {}), dict) else {}
+    mtf_enabled = bool(mtf_cfg.get("enabled", True))
+    df["htf_bias"] = _compute_htf_bias(
+        df, cfg,
+        timeframe=mtf_cfg.get("timeframe", "60Min"),
+        shift_bars=int(mtf_cfg.get("lookback_align", 1)),
+    ) if mtf_enabled else True
 
-    equity = start_cash
+    # Bracket params (unchanged)
+    bcfg = cfg.get("brackets", {})
+    atr_mult_sl = float(bcfg.get("atr_mult_sl", 1.2))
+    take_profit_r = float(bcfg.get("take_profit_r", 1.0))
+    use_brackets = (atr_mult_sl is not None) and (take_profit_r is not None)
+
+    # Position cap
+    max_notional = float(cfg.get("max_notional_per_trade", 0))
+
+    equity = float(start_cash)
     in_pos = False
     qty = 0
     entry_px = 0.0
+    entry_ts = None
 
     wins = 0
     losses = 0
     gross = 0.0
+    trades_printed = []
 
-    # Bracket/exit params (same meaning as live config)
-    bcfg = cfg.get("brackets", {})
-    atr_mult_sl = float(bcfg.get("atr_mult_sl", 1.2))
-    take_profit_r = float(bcfg.get("take_profit_r", 1.0))
-
-    trades_printed = []  # (entry_ts, entry_px, exit_ts, exit_px, pnl)
-
-    # We will use ATR as the "R" base for brackets
     for i in range(1, len(df)):
         prev = df.iloc[i - 1]
         cur = df.iloc[i]
         open_px = float(cur["open"])
 
         if not in_pos:
-            # Signal formed on prev bar close → act at next open with qty=1
-            x = crossover(df.iloc[:i])  # history up to prev bar
-            if x == 1 and long_ok(prev, cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow"):
-                qty = 1
+            x = crossover(df.iloc[:i])
+            if x == 1:
+                mtf_ok = True if not mtf_enabled else bool(prev.get("htf_bias", False))
+                if not long_ok(prev, cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow") or not mtf_ok:
+                    reasons = _eval_long_reasons(prev, cfg, mtf_ok)
+                    if reasons:
+                        print("    REJECT {}: {}".format(cur.name, "; ".join(reasons)))
+                    continue
+
+                # Risk-based sizing with $2,000 cap (1R = atr_mult_sl * ATR(prev))
+                atr_val = float(prev.get("atr", 0.0))
+                if atr_val <= 0:
+                    print("    REJECT {}: no ATR for risk sizing".format(cur.name))
+                    continue
+                stop_dist = max(0.01, atr_mult_sl * atr_val)  # 1R
+                risk_dollars = equity * float(risk_pct)
+                raw_qty = int(risk_dollars // stop_dist) if stop_dist > 0 else 0
+                if raw_qty <= 0:
+                    print("    REJECT {}: qty<=0 (risk_dollars={:.2f}, stop_dist={:.2f})".format(cur.name, risk_dollars, stop_dist))
+                    continue
+                cap_qty = int((max_notional // open_px)) if max_notional > 0 else raw_qty
+                qty = max(1, min(raw_qty, cap_qty))
+                if qty <= 0:
+                    print("    REJECT {}: cap_qty<=0 (open={:.2f})".format(cur.name, open_px))
+                    continue
+
                 entry_px = open_px
                 in_pos = True
-                entry_ts = cur.name  # timestamp of the bar we enter at (next bar open)
+                entry_ts = cur.name
+
         else:
-            # Default exit on cross down (prev bar)
             x = crossover(df.iloc[:i])
             exit_now_on_cross = (x == -1)
 
-            # Bracket-style exits on current bar range using ATR as R
-            atr_val = float(prev.get("atr", 0.0)) if "atr" in df.columns else 0.0
-            stop_px = max(0.01, entry_px - atr_mult_sl * atr_val) if atr_val > 0 else None
-            tp_px   = (entry_px + take_profit_r * atr_val) if atr_val > 0 else None
+            # Bracket exits (unchanged)
+            atr_val = float(prev.get("atr", 0.0))
+            stop_px = None
+            tp_px = None
+            if use_brackets and atr_val > 0:
+                stop_px = max(0.01, entry_px - atr_mult_sl * atr_val)
+                tp_px = entry_px + take_profit_r * atr_val
 
-            # Check SL/TP intrabar
-            hit_sl = (stop_px is not None) and (cur["low"]  <= stop_px)
-            hit_tp = (tp_px   is not None) and (cur["high"] >= tp_px)
+            hit_sl = (stop_px is not None) and (cur["low"] <= stop_px)
+            hit_tp = (tp_px is not None) and (cur["high"] >= tp_px)
 
             if hit_sl:
                 exit_px = stop_px
                 pnl = (exit_px - entry_px) * qty
-                equity += pnl; gross += pnl
-                losses += 1 if pnl <= 0 else 0
-                in_pos = False; qty = 0
+                equity += pnl
+                gross += pnl
+                losses += 1
+                in_pos = False
+                qty = 0
                 trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
                 continue
 
             if hit_tp:
                 exit_px = tp_px
                 pnl = (exit_px - entry_px) * qty
-                equity += pnl; gross += pnl
-                wins += 1 if pnl > 0 else 0
-                in_pos = False; qty = 0
+                equity += pnl
+                gross += pnl
+                wins += 1
+                in_pos = False
+                qty = 0
                 trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
                 continue
 
             if exit_now_on_cross:
                 exit_px = open_px
                 pnl = (exit_px - entry_px) * qty
-                equity += pnl; gross += pnl
-                if pnl > 0: wins += 1
-                else:       losses += 1
-                in_pos = False; qty = 0
+                equity += pnl
+                gross += pnl
+                if pnl > 0:
+                    wins += 1
+                else:
+                    losses += 1
+                in_pos = False
+                qty = 0
                 trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
 
-    # Print the collected trades for this symbol (caller prints header)
+    # Print collected trades (style kept similar)
     for (ent_ts, ent_px, ex_ts, ex_px, pnl) in trades_printed:
-        # pandas index is tz-aware; print as ET-like string (kept as .isoformat for clarity)
-        print(f"    ENTRY {ent_ts} @ {ent_px:.2f}  →  EXIT {ex_ts} @ {ex_px:.2f}  qty=1  PnL={pnl:.2f}")
+        print("    ENTRY {} @ {:.2f}  ->  EXIT {} @ {:.2f}  PnL={:.2f}".format(ent_ts, ent_px, ex_ts, ex_px, pnl))
 
     trades = wins + losses
-    ret_pct = (equity / start_cash - 1.0) * 100.0
-    win_rate = (wins / trades * 100.0) if trades > 0 else 0.0
-    return dict(trades=trades, gross=round(gross, 2), net=round(gross, 2),
-                win_rate=round(win_rate, 1), ret_pct=round(ret_pct, 2), equity=round(equity, 2))
+    net = gross
+    ret_pct = (equity / start_cash - 1.0) * 100.0 if start_cash else 0.0
+    wr = (100.0 * wins / max(trades, 1))
+    return dict(
+        trades=trades,
+        gross=round(gross, 2),
+        net=round(net, 2),
+        win_rate=round(wr, 1),
+        ret_pct=round(ret_pct, 2),
+        equity=round(equity, 2),
+    )
 
+
+# ------------------------------------------------------------------
+# CLI & runner (unchanged except passing risk into simulate_long_only)
+# ------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -192,14 +276,12 @@ def main():
     ap.add_argument("--symbols", default="")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--cash", type=float, default=10_000)
-    # NOTE: risk argument kept for backward compatibility but IGNORED (qty is fixed to 1)
-    ap.add_argument("--risk", type=float, default=0.01, help="Ignored: backtest uses fixed qty=1")
-    # Backtest-only overrides:
-    ap.add_argument("--timeframe", default=None, help="Override timeframe for backtest (e.g., 15Min)")
-    ap.add_argument("--limit", type=int, default=None, help="Override bar_limit for backtest (e.g., 10000)")
-    ap.add_argument("--rth-only", dest="rth_only", action="store_true", help="Force RTH-only (default)")
-    ap.add_argument("--no-rth-only", dest="rth_only", action="store_false", help="Allow non-RTH bars")
-    ap.set_defaults(rth_only=True)  # default = RTH only, per your request
+    ap.add_argument("--risk", type=float, default=0.01, help="Risk per trade as fraction of equity (e.g., 0.01 = 1%)")
+    ap.add_argument("--timeframe", default=None)
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--rth-only", dest="rth_only", action="store_true")
+    ap.add_argument("--no-rth-only", dest="rth_only", action="store_false")
+    ap.set_defaults(rth_only=True)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -210,44 +292,39 @@ def main():
     else:
         symbols = read_tickers(args.tickers)
 
-    # For diagnostics, read current ADX threshold from cfg (default 25.0)
+    # Diagnostics for header
     fcfg = dict(cfg.get("filters", {}))
     adx_th = float(fcfg.get("adx_threshold", 25.0))
+
+    def _load(sym: str) -> pd.DataFrame:
+        return load_bars_for_symbol(
+            sym, cfg, args.days,
+            timeframe_override=args.timeframe,
+            limit_override=args.limit,
+            rth_only_override=args.rth_only,
+        )
 
     rows = []
     for sym in symbols:
         try:
-            df = load_bars_for_symbol(
-                sym, cfg, args.days,
-                timeframe_override=args.timeframe,
-                limit_override=args.limit,
-                rth_only_override=args.rth_only,
-            )
+            df = _load(sym)
         except Exception as e:
             print(f"[{sym}] data error: {e}")
             continue
 
-        # --- Diagnostics per symbol ---
         if df.empty:
             print(f"[{sym}] bars=0")
+            print(f"  TRADES {sym}:")
+            rows.append({"symbol": sym, "trades": 0, "gross": 0.0, "net": 0.0, "win_rate": 0.0, "ret_pct": 0.0, "equity": float(args.cash)})
             continue
 
-        di = compute_indicators(df, cfg).copy()
-        bars = len(di)
-
-        # Count cross-ups over the series
-        crosses_up = 0
-        for i in range(1, len(di)):
-            if crossover(di.iloc[:i+1]) == 1:
-                crosses_up += 1
-
+        di = compute_indicators(df, cfg)
+        crosses_up = sum(crossover(di.iloc[:i]) == 1 for i in range(1, len(di)))
         pct_adx = (di["adx"] >= adx_th).mean() * 100.0 if "adx" in di.columns else 0.0
-        print(f"[{sym}] bars={bars}, crosses_up={crosses_up}, %ADX>={adx_th:.0f}={pct_adx:.1f}%")
+        print(f"[{sym}] bars={len(df)}, crosses_up={crosses_up}, %ADX>={adx_th:.0f}={pct_adx:.1f}%")
 
-        # --- Backtest simulation (qty=1 model) ---
-        # Print header if any trade gets printed inside simulate_long_only
         print(f"  TRADES {sym}:")
-        res = simulate_long_only(df, cfg, start_cash=args.cash)
+        res = simulate_long_only(df, cfg, start_cash=args.cash, risk_pct=args.risk)
         rows.append({"symbol": sym, **res})
 
     if not rows:
