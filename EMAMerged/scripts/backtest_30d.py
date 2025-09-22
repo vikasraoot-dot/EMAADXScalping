@@ -94,22 +94,47 @@ def _eval_long_reasons(prev: pd.Series, cfg: dict, mtf_bias_ok: bool) -> list:
 
 
 # ------------------------------------------------------------------
-# Data loading helper (kept minimal and consistent with your structure)
+# Data loading helper (fixed to match src/data.get_alpaca_bars signature)
 # ------------------------------------------------------------------
 
 def load_bars_for_symbol(symbol: str, cfg: dict, days: int,
                          timeframe_override=None, limit_override=None, rth_only_override=True) -> pd.DataFrame:
+    """
+    Uses EMAMerged/src/data.get_alpaca_bars(key, secret, symbol, timeframe, history_days, bar_limit, feed)
+    and EMAMerged/src/data.filter_rth(df, tz_name, rth_start, rth_end, ...).
+    """
     timeframe = timeframe_override or cfg.get("timeframe", "15Min")
-    limit = limit_override or cfg.get("bar_limit", 10000)
     feed = cfg.get("feed", "iex")
-    df = get_alpaca_bars(symbol, timeframe=timeframe, limit=limit, feed=feed)
+    tz_name = cfg.get("timezone", "US/Eastern")
+
+    # Pull creds from env (consistent with data.get_alpaca_bars usage)
+    key = os.getenv("APCA_API_KEY_ID", "")
+    secret = os.getenv("APCA_API_SECRET_KEY", "")
+
+    # history_days = CLI --days (ensures we fetch enough)
+    history_days = int(days)
+
+    # bar_limit: prefer CLI override if provided, else config bar_limit, else fallback
+    bar_limit = int(limit_override) if (limit_override is not None) else int(cfg.get("bar_limit", 10000))
+
+    df = get_alpaca_bars(
+        key=key,
+        secret=secret,
+        symbol=symbol,
+        timeframe=timeframe,
+        history_days=history_days,
+        bar_limit=bar_limit,
+        feed=feed,
+    )
     if df.empty:
         return df
-    df = drop_unclosed_last_bar(df)
-    if rth_only_override:
-        df = filter_rth(df, cfg.get("rth_start", "09:30"), cfg.get("rth_end", "15:55"))
 
-    # Approx trim by days for 15m bars (keeps things consistent with your prints)
+    df = drop_unclosed_last_bar(df)
+
+    if rth_only_override:
+        df = filter_rth(df, tz_name, cfg.get("rth_start", "09:30"), cfg.get("rth_end", "15:55"))
+
+    # Keep approx last N days at 15m cadence for consistency with old prints
     bars_per_day_15m = 390 // 15  # 26 bars
     approx_rows = int(days) * bars_per_day_15m
     return df.tail(approx_rows)
