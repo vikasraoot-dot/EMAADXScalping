@@ -1,13 +1,11 @@
 from __future__ import annotations
-from typing import Dict, Optional
+
+from typing import Dict, List, Tuple
 import pandas as pd
 import numpy as np
 
 
 # --- Logging helper for diagnostics only ---
-from typing import Dict, List, Tuple
-import pandas as pd
-
 def explain_long_gate(row: pd.Series, cfg: Dict,
                       ema_fast_col: str = "ema_fast",
                       ema_slow_col: str = "ema_slow") -> Tuple[bool, List[str]]:
@@ -33,20 +31,20 @@ def explain_long_gate(row: pd.Series, cfg: Dict,
 
     # EMA slope
     slope_th = fcfg.get("slope_threshold_pct")
-    if slope_th is not None and "ema_slope_pct" in row:
-        slope_val = float(row["ema_slope_pct"])
+    if slope_th is not None and ("ema_slope_pct" in row.index):
+        slope_val = float(row.get("ema_slope_pct", 0.0))
         if slope_val < float(slope_th):
             reasons.append(f"EMA_slope {slope_val:.5f} < {float(slope_th):.5f}")
 
-    # Price filter
-    if fcfg.get("min_price") is not None and float(row.get("close", 0.0)) < float(fcfg["min_price"]):
-        reasons.append(f"Price {row['close']:.2f} < {float(fcfg['min_price']):.2f}")
+    # Price filter (use safe get)
+    px = float(row.get("close", float("nan")))
+    if fcfg.get("min_price") is not None and pd.notna(px) and px < float(fcfg["min_price"]):
+        reasons.append(f"Price {px:.2f} < {float(fcfg['min_price']):.2f}")
 
     # Dollar volume filter
-    if fcfg.get("min_dollar_vol") is not None and "dollar_vol_avg" in row:
-        dv = float(row["dollar_vol_avg"])
-        if dv < float(fcfg["min_dollar_vol"]):
-            reasons.append(f"DollarVol {dv:.0f} < {float(fcfg['min_dollar_vol']):.0f}")
+    dv = float(row.get("dollar_vol_avg", float("nan")))
+    if fcfg.get("min_dollar_vol") is not None and pd.notna(dv) and dv < float(fcfg["min_dollar_vol"]):
+        reasons.append(f"DollarVol {dv:.0f} < {float(fcfg['min_dollar_vol']):.0f}")
 
     # Multi-timeframe bias
     mtf_cfg = fcfg.get("mtf_bias", {})
