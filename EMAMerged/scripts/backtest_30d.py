@@ -64,23 +64,6 @@ def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shi
     # Map back to LTF index via ffill
     return bias.reindex(df.index, method="ffill").fillna(False)
 
-def _reason_key(reason: str) -> str:
-    """
-    Normalize reason strings to compact keys for counting.
-    Examples:
-      "ADX 22.0 < 23.0"        -> "ADX"
-      "RSI 86.2 > 80.0"        -> "RSI"
-      "EMA_slope 0.0005 < ..." -> "EMA_slope"
-      "DollarVol 4200000 < ..."-> "DollarVol"
-      "MTF bias false"         -> "MTF"
-      "Price 9.50 < 10.00"     -> "Price"
-    """
-    r = str(reason).strip()
-    if r.startswith("MTF"):
-        return "MTF"
-    head = r.split(" ", 1)[0]
-    return head
-
 def _eval_long_reasons(prev: pd.Series, cfg: dict, mtf_bias_ok: bool) -> list:
     """
     Build a list of reasons why an entry is rejected.
@@ -414,7 +397,15 @@ def main():
     print("\nTOTAL  trades={}  net={}  win_rate={}%%  avg_ret={}%%  equity_sum={}".format(
         total_trades, total_net, avg_winrate, avg_ret, total_equity
     ))
-
+    # --- Filter Impact Report ---
+    print("\n=== Filter Impact Report ===")
+    total_rejects = sum(FILTER_REJECTS.values())
+    if total_rejects == 0:
+        print("(no rejections recorded)")
+    else:
+        for filt, count in FILTER_REJECTS.most_common():
+            pct = 100.0 * count / total_rejects
+            print(f"{filt:10s} {count:6d} ({pct:4.1f}%)")
 
 if __name__ == "__main__":
     main()
