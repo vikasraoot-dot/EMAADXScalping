@@ -4,6 +4,11 @@ import os
 import sys
 import argparse
 import pandas as pd
+from collections import Counter
+
+# Global counter across all symbols
+FILTER_REJECTS = Counter()
+
 
 # --- Ensure repo root on sys.path so "EMAMerged" imports resolve when run as a script ---
 _THIS = os.path.abspath(os.path.dirname(__file__))
@@ -24,6 +29,23 @@ from EMAMerged.src.filters import long_ok
 # ------------------------------------------------------------------
 # Helpers for instrumentation and light MTF bias (minimal & optional)
 # ------------------------------------------------------------------
+def _reason_key(reason: str) -> str:
+    """
+    Normalize reason strings to compact keys for counting.
+    Examples:
+      "ADX 22.0 < 23.0"        -> "ADX"
+      "RSI 86.2 > 80.0"        -> "RSI"
+      "EMA_slope 0.0005 < ..." -> "EMA_slope"
+      "DollarVol 4200000 < ..."-> "DollarVol"
+      "MTF bias false"         -> "MTF"
+      "Price 9.50 < 10.00"     -> "Price"
+    """
+    r = str(reason).strip()
+    if r.startswith("MTF"):
+        return "MTF"
+    head = r.split(" ", 1)[0]
+    return head
+
 
 def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shift_bars: int = 1) -> pd.Series:
     """
@@ -42,6 +64,22 @@ def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shi
     # Map back to LTF index via ffill
     return bias.reindex(df.index, method="ffill").fillna(False)
 
+def _reason_key(reason: str) -> str:
+    """
+    Normalize reason strings to compact keys for counting.
+    Examples:
+      "ADX 22.0 < 23.0"        -> "ADX"
+      "RSI 86.2 > 80.0"        -> "RSI"
+      "EMA_slope 0.0005 < ..." -> "EMA_slope"
+      "DollarVol 4200000 < ..."-> "DollarVol"
+      "MTF bias false"         -> "MTF"
+      "Price 9.50 < 10.00"     -> "Price"
+    """
+    r = str(reason).strip()
+    if r.startswith("MTF"):
+        return "MTF"
+    head = r.split(" ", 1)[0]
+    return head
 
 def _eval_long_reasons(prev: pd.Series, cfg: dict, mtf_bias_ok: bool) -> list:
     """
@@ -199,7 +237,14 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
                     reasons = _eval_long_reasons(prev, cfg, mtf_ok)
                     if reasons:
                         print("    REJECT {}: {}".format(cur.name, "; ".join(reasons)))
+                        # --- count by normalized reason key ---
+                        for r in reasons:
+                            FILTER_REJECTS[_reason_key(r)] += 1
+                    else:
+                        # still count a generic bucket if no specific reasons were produced
+                        FILTER_REJECTS["UNSPEC"] += 1
                     continue
+
 
                 # Risk-based sizing with $2,000 cap (1R = atr_mult_sl * ATR(prev))
                 atr_val = float(prev.get("atr", 0.0))
