@@ -47,7 +47,7 @@ def _reason_key(reason: str) -> str:
     return head
 
 
-ddef _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shift_bars: int = 1) -> pd.Series:
+def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shift_bars: int = 1) -> pd.Series:
     """
     Light multi-timeframe bias: HTF fast EMA > HTF slow EMA on the prior HTF bar.
     Returns a boolean Series aligned to df.index.
