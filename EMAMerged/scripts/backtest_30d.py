@@ -6,6 +6,8 @@ import argparse
 import pandas as pd
 from collections import Counter
 
+pd.set_option('future.no_silent_downcasting', True)
+
 # Global counter across all symbols
 FILTER_REJECTS = Counter()
 
