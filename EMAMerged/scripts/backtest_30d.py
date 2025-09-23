@@ -47,7 +47,7 @@ def _reason_key(reason: str) -> str:
     return head
 
 
-def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shift_bars: int = 1) -> pd.Series:
+ddef _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shift_bars: int = 1) -> pd.Series:
     """
     Light multi-timeframe bias: HTF fast EMA > HTF slow EMA on the prior HTF bar.
     Returns a boolean Series aligned to df.index.
@@ -60,11 +60,13 @@ def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shi
     htf["ema_fast_htf"] = htf["close"].ewm(span=f, adjust=False, min_periods=f).mean()
     htf["ema_slow_htf"] = htf["close"].ewm(span=s, adjust=False, min_periods=s).mean()
 
-    # Explicitly cast to bool to avoid pandas' future downcasting warning
-    bias = ((htf["ema_fast_htf"] > htf["ema_slow_htf"])
-            .shift(shift_bars)
+    # Compare, shift, then make dtype explicit BEFORE fillna
+    comp = (htf["ema_fast_htf"] > htf["ema_slow_htf"]).shift(shift_bars)
+    bias = (
+        comp.infer_objects(copy=False)   # <- key line to avoid "silent downcasting" path
             .fillna(False)
-            .astype(bool))
+            .astype(bool)
+    )
 
     # Map back to LTF index via ffill and keep dtype boolean
     return bias.reindex(df.index, method="ffill").fillna(False).astype(bool)
