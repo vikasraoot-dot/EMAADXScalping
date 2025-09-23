@@ -34,7 +34,7 @@ filters:
   slope_threshold_pct: 0.0008 # 08 bps per bar
   # Optional quality gates
   min_price: 10.0
-  min_dollar_vol: 2000000
+  min_dollar_vol: 1000000
   dollar_vol_window: 20
 
   # MTF bias
