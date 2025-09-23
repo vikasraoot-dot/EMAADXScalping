@@ -3,6 +3,59 @@ from typing import Dict, Optional
 import pandas as pd
 import numpy as np
 
+
+# --- Logging helper for diagnostics only ---
+from typing import Dict, List, Tuple
+import pandas as pd
+
+def explain_long_gate(row: pd.Series, cfg: Dict,
+                      ema_fast_col: str = "ema_fast",
+                      ema_slow_col: str = "ema_slow") -> Tuple[bool, List[str]]:
+    """
+    Re-run the long entry gate logic but return (ok, reasons).
+    Reasons will include ADX, RSI, EMA slope, price/liquidity, and MTF bias if enabled.
+    """
+    reasons: List[str] = []
+    fcfg = dict(cfg.get("filters", {}))
+
+    # ADX
+    adx_th = float(fcfg.get("adx_threshold", 25.0))
+    adx_val = float(row.get("adx", 0.0))
+    if adx_val < adx_th:
+        reasons.append(f"ADX {adx_val:.1f} < {adx_th:.1f}")
+
+    # RSI
+    rsi_val = float(row.get("rsi", 0.0))
+    if fcfg.get("rsi_min") is not None and rsi_val < float(fcfg["rsi_min"]):
+        reasons.append(f"RSI {rsi_val:.1f} < {float(fcfg['rsi_min']):.1f}")
+    if fcfg.get("rsi_max") is not None and rsi_val > float(fcfg["rsi_max"]):
+        reasons.append(f"RSI {rsi_val:.1f} > {float(fcfg['rsi_max']):.1f}")
+
+    # EMA slope
+    slope_th = fcfg.get("slope_threshold_pct")
+    if slope_th is not None and "ema_slope_pct" in row:
+        slope_val = float(row["ema_slope_pct"])
+        if slope_val < float(slope_th):
+            reasons.append(f"EMA_slope {slope_val:.5f} < {float(slope_th):.5f}")
+
+    # Price filter
+    if fcfg.get("min_price") is not None and float(row.get("close", 0.0)) < float(fcfg["min_price"]):
+        reasons.append(f"Price {row['close']:.2f} < {float(fcfg['min_price']):.2f}")
+
+    # Dollar volume filter
+    if fcfg.get("min_dollar_vol") is not None and "dollar_vol_avg" in row:
+        dv = float(row["dollar_vol_avg"])
+        if dv < float(fcfg["min_dollar_vol"]):
+            reasons.append(f"DollarVol {dv:.0f} < {float(fcfg['min_dollar_vol']):.0f}")
+
+    # Multi-timeframe bias
+    mtf_cfg = fcfg.get("mtf_bias", {})
+    if isinstance(mtf_cfg, dict) and mtf_cfg.get("enabled", False):
+        if not bool(row.get("htf_bias", False)):
+            reasons.append("MTF bias false")
+
+    return (len(reasons) == 0), reasons
+
 # ------------------------------------------------------------
 # ADX/RSI/EMA-slope verifiers for the "long gate"
 # ------------------------------------------------------------
