@@ -37,6 +37,12 @@ filters:
   min_dollar_vol: 2000000
   dollar_vol_window: 20
 
+  # MTF bias
+  mtf_bias:
+    enabled: false         # set false to disable everywhere
+    timeframe: "60Min"    # higher timeframe to check
+    lookback_align: 1     # how many HTF bars to shift for confirmation
+
 # POSITION / RISK
 allow_shorts: false
 qty: 1                        # ALWAYS 1 share per entry
