@@ -60,10 +60,15 @@ def _compute_htf_bias(df: pd.DataFrame, cfg: dict, timeframe: str = "60Min", shi
     htf["ema_fast_htf"] = htf["close"].ewm(span=f, adjust=False, min_periods=f).mean()
     htf["ema_slow_htf"] = htf["close"].ewm(span=s, adjust=False, min_periods=s).mean()
 
-    bias = (htf["ema_fast_htf"] > htf["ema_slow_htf"]).shift(shift_bars).fillna(False)
-    # Map back to LTF index via ffill
-    return bias.reindex(df.index, method="ffill").fillna(False)
+    # Explicitly cast to bool to avoid pandas' future downcasting warning
+    bias = ((htf["ema_fast_htf"] > htf["ema_slow_htf"])
+            .shift(shift_bars)
+            .fillna(False)
+            .astype(bool))
 
+    # Map back to LTF index via ffill and keep dtype boolean
+    return bias.reindex(df.index, method="ffill").fillna(False).astype(bool)
+    
 def _eval_long_reasons(prev: pd.Series, cfg: dict, mtf_bias_ok: bool) -> list:
     """
     Build a list of reasons why an entry is rejected.
