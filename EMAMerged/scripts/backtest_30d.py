@@ -129,7 +129,7 @@ def load_bars_for_symbol(symbol: str, cfg: dict, days: int,
     if df.empty:
         return df
 
-    df = drop_unclosed_last_bar(df)
+    df = drop_unclosed_last_bar(df,timeframe)
 
     if rth_only_override:
         df = filter_rth(df, tz_name, cfg.get("rth_start", "09:30"), cfg.get("rth_end", "15:55"))
