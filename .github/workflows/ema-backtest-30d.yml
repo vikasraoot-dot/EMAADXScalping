@@ -41,8 +41,8 @@ jobs:
 
       - name: Run backtest
         env:
-          ALPACA_API_KEY_ID:    ${{ secrets.ALPACA_KEY }}
-          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET }}
+          APCA_API_KEY_ID:    ${{ secrets.ALPACA_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET }}
         run: |
           $syms = "${{ github.event.inputs.tickers }}".Trim()
           $argSyms = ""
