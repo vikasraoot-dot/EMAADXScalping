@@ -10,7 +10,7 @@ from EMAMerged.src.data import (
     get_positions, get_open_orders, submit_market_order, submit_bracket_order,
 )
 from EMAMerged.src.strategy import compute_indicators, crossover
-from EMAMerged.src.filters import long_ok
+from EMAMerged.src.filters import long_ok, explain_long_gate
 
 # -------------------------
 # Env helpers / overrides
@@ -143,8 +143,12 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
             gated_cfg["filters"] = f
 
         if not long_ok(df.iloc[i], gated_cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow"):
-            print(f"[{sym}] long gate BLOCKED (overrides={overrides or 'none'})")
+            _, reasons = explain_long_gate(df.iloc[i], gated_cfg,
+                                   ema_fast_col="ema_fast", ema_slow_col="ema_slow")
+            print(f"[{sym}] long gate BLOCKED: {'; '.join(reasons) if reasons else 'unspecified'} (overrides={overrides or 'none'})")
             return
+
+
 
         # qty=1 and notional cap
         qty = int(cfg.get("qty", 1)) or 1
