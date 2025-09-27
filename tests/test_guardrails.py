@@ -76,10 +76,11 @@ def test_guardrails_eod_flatten_invokes_cancel_and_close(monkeypatch):
 # ---------- Test 2: 422 cooldown behavior ----------
 #
 
-def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
+def test_guardrails_422_cooldown_sets_and_future_timestamp(monkeypatch):
     """
-    Force a 422 on bracket submit.
-    Verify the symbol is put on a 15m cooldown and subsequent attempt skips.
+    Force a 422 on bracket submit and verify the symbol is put on a cooldown
+    with a timestamp in the future. We call manage_symbol() directly, so we
+    assert cooldown state (the 'skip' log lives in main()'s loop).
     """
     import EMAMerged.scripts.live_paper_loop as live
     import EMAMerged.src.data as data_mod  # patch source too, to avoid tz-localize paths
@@ -133,12 +134,11 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     args = types.SimpleNamespace(dry_run=0)
     live.manage_symbol(sym, cfg, args)
 
+    # Cooldown state is set by manage_symbol() upon 422
     assert sym in live._ERROR_COOLDOWN, "422 should place symbol on cooldown"
-
-    # second call should skip due to cooldown
-    live.manage_symbol(sym, cfg, args)
-    out = capsys.readouterr().out
-    assert "on error cooldown" in out
+    # And the timestamp should be in the future relative to now
+    now_et = pd.Timestamp.now(tz="US/Eastern")
+    assert live._ERROR_COOLDOWN[sym] > now_et, "cooldown expiry should be in the future"
 
 #
 # ---------- Test 3: Breakeven stop bump ----------
