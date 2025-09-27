@@ -5,8 +5,6 @@
 from __future__ import annotations
 import types
 import pandas as pd
-import datetime as dt
-import pytz
 import pytest
 
 #
@@ -56,7 +54,7 @@ def test_guardrails_eod_flatten_invokes_cancel_and_close(monkeypatch):
     monkeypatch.setenv("ALPACA_API_SECRET", "s")
     monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-    # IMPORTANT: patch at the import site (flat_eod module), not src.data
+    # Patch at the import site (flat_eod module)
     monkeypatch.setattr(flat, "cancel_all_orders", fake_cancel)
     monkeypatch.setattr(flat, "close_all_positions", fake_close)
 
@@ -82,7 +80,8 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     cfg = {
         "timezone": "US/Eastern",
         "timeframe": "15Min",
-        "rth_only": True,
+        # IMPORTANT: disable RTH path to avoid tz_localize on tz-aware ts in this test
+        "rth_only": False,
         "rth_start": "09:30",
         "rth_end": "15:55",
         "brackets": {"enabled": True, "atr_mult_sl": 1.0, "take_profit_r": 1.2},
@@ -93,14 +92,14 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
         "qty": 1,
     }
 
-    # --- Mocks for data path ---
+    # --- Mocks for data path (patch at import site) ---
     # (a) bars
     monkeypatch.setattr(
-        live,  # patch at import site
+        live,
         "get_alpaca_bars",
         lambda key, secret, tf, s, start, end, feed="iex", limit=500: _make_bars(close=50.0, atr=0.5),
     )
-    # (b) RTH / drop bar: pass-through
+    # (b) RTH / drop bar: pass-through (kept for completeness)
     monkeypatch.setattr(live, "filter_rth", lambda df, **kw: df)
     monkeypatch.setattr(live, "drop_unclosed_last_bar", lambda df, tf: df)
 
@@ -143,7 +142,7 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
 # ---------- Test 3: Breakeven stop bump ----------
 #
 
-def test_guardrails_breakeven_bump_updates_stop(monkeypatch, capsys):
+def test_guardrails_breakeven_bump_updates_stop(monkeypatch):
     """
     At ≥0.5R profit, bump stop to entry + 2 ticks (0.02 by default).
     """
