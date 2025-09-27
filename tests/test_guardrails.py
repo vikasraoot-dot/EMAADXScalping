@@ -73,6 +73,7 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     Verify the symbol is put on a 15m cooldown and subsequent attempt skips.
     """
     import EMAMerged.scripts.live_paper_loop as live
+    import EMAMerged.src.data as data_mod
 
     sym = "TEST"
 
@@ -80,7 +81,7 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     cfg = {
         "timezone": "US/Eastern",
         "timeframe": "15Min",
-        # IMPORTANT: disable RTH path to avoid tz_localize on tz-aware ts in this test
+        # disable RTH path; orthogonal to this test
         "rth_only": False,
         "rth_start": "09:30",
         "rth_end": "15:55",
@@ -92,16 +93,19 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
         "qty": 1,
     }
 
-    # --- Mocks for data path (patch at import site) ---
+    # --- Mocks for data path (patch BOTH import site and source module) ---
     # (a) bars
     monkeypatch.setattr(
         live,
         "get_alpaca_bars",
         lambda key, secret, tf, s, start, end, feed="iex", limit=500: _make_bars(close=50.0, atr=0.5),
     )
-    # (b) RTH / drop bar: pass-through (kept for completeness)
+
+    # (b) RTH / drop bar: hard-bypass anywhere they might be referenced
     monkeypatch.setattr(live, "filter_rth", lambda df, **kw: df)
     monkeypatch.setattr(live, "drop_unclosed_last_bar", lambda df, tf: df)
+    monkeypatch.setattr(data_mod, "filter_rth", lambda df, **kw: df)
+    monkeypatch.setattr(data_mod, "drop_unclosed_last_bar", lambda df, tf: df)
 
     # (c) indicators/signal
     monkeypatch.setattr(live, "compute_indicators", lambda df, cfg: df)
