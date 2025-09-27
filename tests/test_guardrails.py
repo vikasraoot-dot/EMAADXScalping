@@ -73,6 +73,7 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     Verify the symbol is put on a 15m cooldown and subsequent attempt skips.
     """
     import EMAMerged.scripts.live_paper_loop as live
+    import EMAMerged.src.data as data_mod  # patch source too, to avoid tz-localize paths
 
     sym = "TEST"
 
@@ -91,12 +92,15 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
         "qty": 1,
     }
 
-    # --- Minimal mocks to jump straight to order placement ---
-    # Bypass bar-prep entirely (avoids tz-localize paths)
-    monkeypatch.setattr(live, "get_alpaca_bars", lambda *a, **kw: pd.DataFrame())
-    # Keep these as no-ops (not used because df is empty, but safe)
+    # --- Mocks to ensure a NON-empty bars df and bypass tz logic everywhere ---
+    bars = _make_bars(close=50.0, atr=0.5)
+    monkeypatch.setattr(live, "get_alpaca_bars", lambda *a, **kw: bars)
+
+    # No-op filters at BOTH import site and source module
     monkeypatch.setattr(live, "filter_rth", lambda df, **kw: df)
     monkeypatch.setattr(live, "drop_unclosed_last_bar", lambda df, tf: df)
+    monkeypatch.setattr(data_mod, "filter_rth", lambda df, **kw: df)
+    monkeypatch.setattr(data_mod, "drop_unclosed_last_bar", lambda df, tf: df)
 
     # Pretend signal & gating are always long/ok
     monkeypatch.setattr(live, "compute_indicators", lambda df, cfg: df)
@@ -169,6 +173,7 @@ def test_guardrails_breakeven_bump_updates_stop(monkeypatch):
     last = 100.10  # >= entry + 0.5R ⇒ triggers bump
 
     # Call the internal helper directly
+    import math
     live._maybe_breakeven_bump("XYZ", cfg, entry, r_dist, last)
 
     assert patched["patched"] is True, "patch_order should be called once"
