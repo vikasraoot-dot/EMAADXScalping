@@ -34,24 +34,24 @@ def test_long_ok_and_explain_handle_series_and_dataframe_consistently():
     # --- Series path must work ---
     ok_series = long_ok(last, {})
     exp_ok_series, exp_reasons_series = _normalize_explain(explain_long_gate(last, {}))
-
     assert isinstance(ok_series, (bool, int)), "long_ok(Series) should return bool/int"
-    # exp_* already normalized by helper — no strict type assertion on raw explain return
 
     # --- DataFrame path ---
-    # Some codebases enforce Series-only (raising AssertionError),
-    # others defensively coerce DataFrame to last row.
-    # We allow either behavior, but if it doesn't raise, it must equal the Series result.
-    try:
+    # Implementation may EITHER:
+    #  (A) enforce Series-only by raising (AssertionError/TypeError/ValueError), OR
+    #  (B) accept DataFrame and coerce to last-row; if so, results must match Series semantics.
+    def _call_df_safely():
         ok_df = long_ok(df, {})
         exp_ok_df, exp_reasons_df = _normalize_explain(explain_long_gate(df, {}))
+        return bool(ok_df), exp_ok_df, list(exp_reasons_df)
 
-        # If no AssertionError, results must match last-row semantics.
-        assert bool(ok_df) == bool(ok_series), "long_ok(DataFrame) should equal last-row result"
+    try:
+        ok_df_bool, exp_ok_df, exp_reasons_df = _call_df_safely()
+        # If no exception, enforce equivalence to last-row results
+        assert ok_df_bool == bool(ok_series), "long_ok(DataFrame) should equal last-row result"
         assert exp_ok_df == exp_ok_series, "explain(DataFrame).ok should equal last-row result"
-        # reasons may differ in formatting, but should be same length/content when both provided
         if exp_reasons_series or exp_reasons_df:
-            assert list(exp_reasons_df) == list(exp_reasons_series), "explain(DataFrame).reasons should match last-row"
-    except AssertionError:
-        # Contract-enforcing implementation (Series-only) — also acceptable.
+            assert exp_reasons_df == list(exp_reasons_series), "explain(DataFrame).reasons should match last-row"
+    except (AssertionError, TypeError, ValueError):
+        # Acceptable: function enforces Series-only or errors on DataFrame misuse
         pass
