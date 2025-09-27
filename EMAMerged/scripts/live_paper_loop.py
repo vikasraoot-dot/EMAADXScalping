@@ -8,6 +8,7 @@ from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
 from EMAMerged.src.data import (
     get_alpaca_bars, filter_rth, drop_unclosed_last_bar, alpaca_market_open,
     get_positions, get_open_orders, submit_market_order, submit_bracket_order,
+    list_open_orders, patch_order
 )
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok, explain_long_gate
@@ -49,6 +50,53 @@ def _append_csv(path: str, row: dict):
     header = not os.path.exists(path)
     df.to_csv(path, mode="a", index=False, header=header)
 
+_ERROR_COOLDOWN = {}  # sym -> datetime until retries allowed on 422
+
+# -------------------------
+# Optional: breakeven bump helper
+# -------------------------
+def _maybe_breakeven_bump(sym: str, cfg: dict, entry_price: float, r_dist: float, last_price: float):
+    be = cfg.get("breakeven", {}) or {}
+    if not be.get("enabled", True):
+        return
+    if r_dist <= 0:
+        return
+
+    trigger_r = float(be.get("trigger_r", 0.5))
+    tick = float(be.get("tick_size", 0.01))
+    bump_ticks = int(be.get("bump_ticks", 2))
+    bump_price = round2(entry_price + bump_ticks * tick)
+
+    r_mult = (last_price - entry_price) / r_dist
+    if r_mult < trigger_r:
+        return
+
+    base, key, secret = _alpaca_creds()
+    # find open stop for this symbol; nested open orders lists children
+    try:
+        orders = list_open_orders(base, key, secret, symbols=[sym])
+    except Exception as e:
+        print(f"[{sym}] breakeven list orders error: {e}")
+        return
+
+    stop_os = [o for o in orders
+               if o.get("symbol") == sym
+               and o.get("side") == "sell"
+               and (o.get("type") in ("stop", "stop_limit"))]
+    if not stop_os:
+        return
+
+    stop_o = stop_os[0]
+    cur_stop = float(stop_o.get("stop_price") or 0.0)
+    if bump_price <= cur_stop:
+        return
+
+    try:
+        patch_order(base, key, secret, stop_o["id"], stop_price=bump_price)
+        print(f"[{sym}] breakeven bump: stop {cur_stop} → {bump_price} (r={r_mult:.2f})", flush=True)
+    except Exception as e:
+        print(f"[{sym}] breakeven bump error: {e}", flush=True)
+
 # -------------------------
 # Main per-symbol routine
 # -------------------------
@@ -62,31 +110,26 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
 
     # Fetch bars
     try:
-        df = get_alpaca_bars(key, secret, sym, timeframe=tf, history_days=hist_days, bar_limit=limit, feed=feed)
+        end = new_york_now()
+        start = end - timedelta(days=hist_days)
+        df = get_alpaca_bars(key, secret, tf, sym, start, end, feed=feed, limit=limit)
+        if bool(cfg.get("rth_only", True)):
+            df = filter_rth(df, tz_name=tz, rth_start=cfg.get("rth_start","09:30"), rth_end=cfg.get("rth_end","15:55"))
+        df = drop_unclosed_last_bar(df, tf)
+        if df.empty:
+            print(f"[{sym}] no bars")
+            return
     except Exception as e:
-        print(f"[{sym}] data error: {e}")
+        print(f"[{sym}] bars error: {e}")
         return
 
-    if df.empty:
-        print(f"[{sym}] no bars")
-        return
-
-    # RTH + remove last unclosed
-    if bool(cfg.get("rth_only", True)):
-        df = filter_rth(df, tz_name=tz, rth_start=cfg.get("rth_start", "09:30"),
-                        rth_end=cfg.get("rth_end", "15:55"), allowed_windows=cfg.get("entry_windows"))
-    df = drop_unclosed_last_bar(df, timeframe=tf)
-    if len(df) < 3:
-        print(f"[{sym}] not enough bars after filtering")
-        return
-
-    # Indicators & signal
     df = compute_indicators(df, cfg)
     x = crossover(df)
     close = float(df["close"].iat[-1])
-    i = len(df) - 1
-    ts_ny = new_york_now().strftime("%Y-%m-%d %H:%M")
-    print(f"[{sym}] {ts_ny} close={round2(close)} cross={x}")
+
+    # C) Log the last CLOSED bar time (bar timestamp), not wall-clock
+    bar_ts = df.index[-1].tz_convert(pytz.timezone(tz)).strftime("%Y-%m-%d %H:%M")
+    print(f"[{sym}] {bar_ts} close={round2(close)} cross={x}")
 
     # Positions / open orders
     try:
@@ -103,55 +146,28 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
     qty_open = int(float(positions.get(sym, {}).get("qty", "0") or 0))
     side_open = "long" if qty_open > 0 else ("short" if qty_open < 0 else None)
 
-    # Near close guard: no NEW entries within last N minutes
-    if qty_open == 0 and x == 1 and cfg.get("no_new_entries_last_min", 0):
+    # A) Late entry cutoff: no NEW entries within last N minutes
+    if qty_open == 0 and x == 1 and cfg.get("entry_cutoff_min", 0):
         try:
             et_tz = pytz.timezone(tz)
             now_et = new_york_now().astimezone(et_tz)
             rth_end = datetime.strptime(cfg.get("rth_end","15:55"), "%H:%M").time()
             rth_end_dt = now_et.replace(hour=rth_end.hour, minute=rth_end.minute, second=0, microsecond=0)
             remaining = (rth_end_dt - now_et).total_seconds() / 60.0
-            if remaining <= float(cfg["no_new_entries_last_min"]):
-                print(f"[{sym}] blocked: within last {cfg['no_new_entries_last_min']} min before close")
-                x = 0
-        except Exception:
-            pass
+            cutoff = int(cfg.get("entry_cutoff_min", 20))
+            if remaining <= cutoff:
+                print(f"[{sym}] skip entry: {remaining:.0f}m to close ≤ cutoff {cutoff}m")
+                return
+        except Exception as e:
+            print(f"[{sym}] cutoff check error: {e}")
 
-    results_dir = cfg.get("results_dir","results")
-    _results_dir(results_dir)
+    # Long entry path
+    if qty_open == 0 and x == 1 and long_ok(df, cfg):
+        reasons = explain_long_gate(df, cfg)
+        if reasons:
+            print(f"[{sym}] gate reasons: {reasons}")
 
-    # =========================
-    # ENTRY
-    # =========================
-    if qty_open == 0 and x == 1:
-        # Apply overrides (optional): FILTER_ADX, FILTER_RSI_MIN/MAX, FILTER_SLOPE_PCT
-        overrides = {}
-        if os.environ.get("FILTER_ADX"):
-            overrides["adx_threshold"] = _env_float("FILTER_ADX", 22.0)
-        if os.environ.get("FILTER_RSI_MIN"):
-            overrides["rsi_min"] = _env_float("FILTER_RSI_MIN", 50.0)
-        if os.environ.get("FILTER_RSI_MAX"):
-            overrides["rsi_max"] = _env_float("FILTER_RSI_MAX", 80.0)
-        if os.environ.get("FILTER_SLOPE_PCT"):
-            overrides["slope_threshold_pct"] = _env_float("FILTER_SLOPE_PCT", 0.0012)
-
-        # Evaluate gate
-        gated_cfg = dict(cfg)
-        if overrides:
-            f = dict(cfg.get("filters", {}))
-            f.update(overrides)
-            gated_cfg["filters"] = f
-
-        if not long_ok(df.iloc[i], gated_cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow"):
-            _, reasons = explain_long_gate(df.iloc[i], gated_cfg,
-                                   ema_fast_col="ema_fast", ema_slow_col="ema_slow")
-            print(f"[{sym}] long gate BLOCKED: {'; '.join(reasons) if reasons else 'unspecified'} (overrides={overrides or 'none'})")
-            return
-
-
-
-        # qty=1 and notional cap
-        qty = int(cfg.get("qty", 1)) or 1
+        qty = int(cfg.get("qty", 1) or 1)
         max_notional = float(cfg.get("max_notional_per_trade", 0) or 0.0)
         if max_notional > 0 and close > max_notional:
             print(f"[{sym}] skip: price {round2(close)} exceeds notional cap {round2(max_notional)}")
@@ -161,13 +177,15 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
         brackets_cfg = cfg.get("brackets", {})
         use_brackets = bool(brackets_cfg.get("enabled", True))
 
-        # Compute SL/TP using ATR R multiple
+        # Compute SL/TP using ATR R multiple — B) harden spacing
         atr_mult = float(brackets_cfg.get("atr_mult_sl", 1.2))
         take_r  = float(brackets_cfg.get("take_profit_r", 1.0))
         atr_val = float(df["atr"].iat[-1]) if "atr" in df.columns else 0.0
-        r_dist  = atr_mult * atr_val
-        stop_price = max(0.01, close - r_dist)  # long stop below
+        r_dist  = max(0.02, atr_mult * atr_val)  # ≥ $0.02 (two ticks) risk
+        stop_price = max(0.01, close - r_dist)
         tp_price   = close + take_r * r_dist
+        if tp_price <= close + 0.01:
+            tp_price = close + 0.02
 
         # idempotent COID
         coid = f"EMA-ENTRY-{sym}-{df.index[-1].strftime('%Y%m%d%H%M')}"
@@ -184,44 +202,33 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
                         take_profit_price=tp_price, stop_price=stop_price, stop_limit_price=None
                     )
                 else:
-                    submit_market_order(base, key, secret, sym, qty, "buy", coid)
+                    submit_market_order(base, key, secret, sym, qty=qty, side="buy", client_order_id=coid)
                 print(f"[{sym}] ENTRY BUY qty={qty} @ ~{round2(close)} (brackets={use_brackets})")
-                _append_csv(os.path.join(results_dir,"live_orders.csv"), {
-                    "ts": df.index[-1].isoformat(),
-                    "symbol": sym, "side": "buy", "qty": qty, "price": round2(close),
-                    "stop": round2(stop_price), "take_profit": round2(tp_price),
-                    "coid": coid, "brackets": int(use_brackets)
-                })
             except Exception as e:
-                print(f"[{sym}] entry error: {e}")
+                msg = str(e)
+                print(f"[{sym}] entry error: {msg}")
+                # B) 422 cooldown (15m)
+                if "422" in msg or "Unprocessable" in msg:
+                    _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=15)
+                return
 
-    # =========================
-    # EXIT (auto, safe & idempotent)
-    # =========================
-    if qty_open > 0 and x == -1:
-        # If there is already an open SELL/exit order, do nothing (idempotence)
-        has_exit_open = any(o.get("symbol")==sym and o.get("side")=="sell" for o in open_orders)
-        if has_exit_open:
-            print(f"[{sym}] exit already pending; skip duplicate")
-            return
-        coid = f"EMA-EXIT-{sym}-{df.index[-1].strftime('%Y%m%d%H%M')}"
-        if args.dry_run:
-            print(f"[{sym}] DRY EXIT SELL qty={qty_open} @ ~{round2(close)}")
-        else:
-            try:
-                submit_market_order(base, key, secret, sym, qty_open, "sell", coid)
-                print(f"[{sym}] EXIT SELL qty={qty_open} @ ~{round2(close)}")
-                _append_csv(os.path.join(results_dir,"live_orders.csv"), {
-                    "ts": df.index[-1].isoformat(),
-                    "symbol": sym, "side": "sell", "qty": qty_open, "price": round2(close),
-                    "coid": coid, "reason": "ema_cross_down"
-                })
-            except Exception as e:
-                print(f"[{sym}] exit error: {e}")
+    # If we have a position, optionally try breakeven bump
+    if qty_open > 0:
+        try:
+            pos = positions.get(sym)
+            entry_price = float(pos["avg_entry_price"]) if pos else 0.0
+            # approximate r_dist using the same ATR logic used above
+            atr_val = float(df["atr"].iat[-1]) if "atr" in df.columns else 0.0
+            atr_mult = float(cfg.get("brackets", {}).get("atr_mult_sl", 1.2))
+            r_dist  = max(0.02, atr_mult * atr_val)
+            _maybe_breakeven_bump(sym, cfg, entry_price, r_dist, last_price=close)
+        except Exception as e:
+            print(f"[{sym}] breakeven check error: {e}")
 
-    # Snapshot positions for audit
+    # Snapshot
     try:
-        positions = get_positions(base, key, secret)
+        results_dir = cfg.get("results_dir", "results")
+        _results_dir(results_dir)
         pos = positions.get(sym)
         row = {
             "ts": df.index[-1].isoformat(),
@@ -252,6 +259,7 @@ def main():
     base, key, secret = _alpaca_creds()
     if not args.force_run:
         try:
+            from EMAMerged.src.data import alpaca_market_open
             if not alpaca_market_open(base, key, secret):
                 print("[GATE] Market closed; exiting.")
                 return
@@ -259,15 +267,18 @@ def main():
             print(f"[GATE] clock error: {e}")
             return
 
-    # Load symbols
     if args.symbols.strip():
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     else:
         symbols = read_tickers(args.tickers)
 
-    # Per-symbol isolation
     for sym in symbols:
         try:
+            # B) per-symbol cooldown check
+            until = _ERROR_COOLDOWN.get(sym)
+            if until and new_york_now() < until:
+                print(f"[{sym}] on error cooldown until {until.strftime('%H:%M')} (skip)")
+                continue
             manage_symbol(sym, cfg, args)
         except Exception as e:
             print(f"[{sym}] fatal: {e}")
