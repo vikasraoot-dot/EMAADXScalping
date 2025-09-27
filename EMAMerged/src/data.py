@@ -18,10 +18,9 @@ def _req_with_retry(method: str, url: str, headers: dict, timeout: int = 20,
         try:
             r = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
             if r.status_code in RETRY_STATUS:
-                raise requests.HTTPError(f"Retryable status {r.status_code}", response=r)
-            r.raise_for_status()
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
             return r
-        except Exception as e:
+        except Exception:
             attempt += 1
             if attempt > max_retries:
                 raise
@@ -51,36 +50,32 @@ def _iso(dt_obj: dt.datetime) -> str:
 def get_alpaca_bars(
     key: str,
     secret: str,
+    timeframe: str,
     symbol: str,
-    timeframe: str = "5Min",
-    history_days: int = 90,
-    bar_limit: int = 500,
+    start: dt.datetime,
+    end: dt.datetime,
     feed: str = "iex",
+    limit: int = 500,
 ) -> pd.DataFrame:
-    end = _now_utc()
-    start = end - dt.timedelta(days=history_days)
-    url = "https://data.alpaca.markets/v2/stocks/bars"
+    # v2/data/bars endpoint
+    tf = timeframe
+    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     params = {
-        "symbols": symbol,
-        "timeframe": timeframe,
-        "start": _iso(start),
-        "end": _iso(end),
-        "limit": bar_limit,
-        "feed": feed,
-        "adjustment": "raw",
+        "timeframe": tf, "start": _iso(start), "end": _iso(end),
+        "adjustment": "raw", "feed": feed, "limit": limit
     }
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), params=params, timeout=30)
-    j = r.json()
-    arr = j.get("bars", {}).get(symbol, [])
-    if not arr:
+    r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=20, params=params)
+    js = r.json()
+    bars = js.get("bars", [])
+    if not bars:
         return pd.DataFrame()
-    df = pd.DataFrame(arr)
-    df = df.rename(columns={"t":"timestamp","o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.set_index("timestamp").sort_index()
-    return df[["open","high","low","close","volume"]]
+    df = pd.DataFrame(bars)
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
+    df = df.set_index("time").sort_index()
+    return df
 
-def filter_rth(df: pd.DataFrame, tz_name: str, rth_start: str, rth_end: str,
+def filter_rth(df: pd.DataFrame, tz_name: str = "US/Eastern", rth_start: str = "09:30", rth_end: str = "16:00",
                allowed_windows: Optional[List[dict]] = None) -> pd.DataFrame:
     if df.empty:
         return df
@@ -101,10 +96,18 @@ def filter_rth(df: pd.DataFrame, tz_name: str, rth_start: str, rth_end: str,
     local.index = local.index.tz_convert("UTC")
     return local
 
+def _tf_minutes(timeframe: str) -> int:
+    digits = "".join(ch for ch in timeframe if ch.isdigit())
+    return int(digits or "1")
+
 def drop_unclosed_last_bar(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    if df.empty:
+    if df.empty or len(df) == 1:
         return df
-    return df.iloc[:-1] if len(df) > 1 else df
+    last = df.index[-1].tz_convert("UTC")
+    now  = _now_utc()
+    mins = _tf_minutes(timeframe)
+    # only drop if bar is truly still in-progress for this timeframe
+    return df.iloc[:-1] if (now - last) < pd.Timedelta(minutes=mins) else df
 
 # --- Orders / Positions / Open orders ---
 def get_positions(base_url: str, key: str, secret: str) -> Dict[str, Dict[str, Any]]:
@@ -112,40 +115,36 @@ def get_positions(base_url: str, key: str, secret: str) -> Dict[str, Dict[str, A
     r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=15)
     if r.status_code == 404:
         return {}
-    out = {}
-    for p in r.json():
+    arr = r.json() if r.text else []
+    out: Dict[str, Dict[str, Any]] = {}
+    for p in arr:
         out[p["symbol"]] = p
     return out
 
 def get_open_orders(base_url: str, key: str, secret: str, symbol: str | None = None) -> list[dict]:
-    url = f"{base_url.rstrip('/')}/v2/orders"
-    params = {"status": "open"}
+    url = f"{base_url.rstrip('/')}/v2/orders?status=open&nested=true"
     if symbol:
-        params["symbols"] = symbol
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), params=params, timeout=15)
-    return r.json()
+        url += f"&symbols={symbol}"
+    r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=15)
+    return r.json() if r.text else []
 
 def submit_market_order(base_url: str, key: str, secret: str,
-                        symbol: str, qty: int, side: str, client_order_id: str) -> dict:
+                        symbol: str, qty: int, side: str, client_order_id: str | None = None) -> dict:
     url = f"{base_url.rstrip('/')}/v2/orders"
     payload = {
-        "symbol": symbol,
-        "qty": qty,
-        "side": side,
-        "type": "market",
-        "time_in_force": "day",
-        "client_order_id": client_order_id,
+        "symbol": symbol, "qty": qty, "side": side, "type": "market",
+        "time_in_force": "day"
     }
+    if client_order_id:
+        payload["client_order_id"] = client_order_id
     r = _req_with_retry("POST", url, headers=_headers(key, secret), json=payload, timeout=20)
     return r.json()
 
 def submit_bracket_order(base_url: str, key: str, secret: str,
                          symbol: str, qty: int, side: str,
-                         entry_type: str, client_order_id: str,
-                         take_profit_price: float, stop_price: float, stop_limit_price: float | None = None) -> dict:
-    """
-    Alpaca bracket order. entry_type: "market" or "limit" (we use "market").
-    """
+                         entry_type: str = "market", client_order_id: str | None = None,
+                         take_profit_price: float = 0.0, stop_price: float = 0.0,
+                         stop_limit_price: float | None = None) -> dict:
     url = f"{base_url.rstrip('/')}/v2/orders"
     payload = {
         "symbol": symbol,
@@ -157,7 +156,32 @@ def submit_bracket_order(base_url: str, key: str, secret: str,
         "client_order_id": client_order_id,
         "take_profit": {"limit_price": round(take_profit_price, 2)},
         "stop_loss":   {"stop_price": round(stop_price, 2)} if not stop_limit_price else
-                       {"stop_price": round(stop_price, 2), "limit_price": round(stop_limit_price, 2)},
+                       {"stop_price": round(stop_limit_price if stop_limit_price < stop_price else stop_price, 2),
+                        "limit_price": round(stop_limit_price, 2)},
     }
     r = _req_with_retry("POST", url, headers=_headers(key, secret), json=payload, timeout=20)
     return r.json()
+
+def cancel_all_orders(base_url: str, key: str, secret: str) -> dict:
+    url = f"{base_url.rstrip('/')}/v2/orders"
+    r = _req_with_retry("DELETE", url, headers=_headers(key, secret), timeout=20)
+    return r.json() if r.text else {}
+
+def close_all_positions(base_url: str, key: str, secret: str) -> dict:
+    url = f"{base_url.rstrip('/')}/v2/positions"
+    r = _req_with_retry("DELETE", url, headers=_headers(key, secret), timeout=30)
+    return r.json() if r.text else {}
+
+def list_open_orders(base_url: str, key: str, secret: str, symbols: list[str] | None = None) -> list[dict]:
+    url = f"{base_url.rstrip('/')}/v2/orders?status=open&nested=true"
+    r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=20)
+    orders = r.json() if r.text else []
+    if symbols:
+        syms = set(s.upper() for s in symbols)
+        orders = [o for o in orders if o.get("symbol","").upper() in syms]
+    return orders
+
+def patch_order(base_url: str, key: str, secret: str, order_id: str, **fields) -> dict:
+    url = f"{base_url.rstrip('/')}/v2/orders/{order_id}"
+    r = _req_with_retry("PATCH", url, headers=_headers(key, secret), timeout=20, json=fields)
+    return r.json() if r.text else {}
