@@ -69,15 +69,13 @@ def test_guardrails_eod_flatten_invokes_cancel_and_close(monkeypatch):
 
 def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     """
-    Simulate a long entry that raises a 422 on bracket submit.
+    Force a 422 on bracket submit.
     Verify the symbol is put on a 15m cooldown and subsequent attempt skips.
     """
     import EMAMerged.scripts.live_paper_loop as live
-    import EMAMerged.src.data as data_mod
 
     sym = "TEST"
 
-    # Minimal config for the path
     cfg = {
         "timezone": "US/Eastern",
         "timeframe": "15Min",
@@ -86,61 +84,48 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
         "rth_start": "09:30",
         "rth_end": "15:55",
         "brackets": {"enabled": True, "atr_mult_sl": 1.0, "take_profit_r": 1.2},
-        "entry_cutoff_min": 0,  # disable cutoff for this test
+        "entry_cutoff_min": 0,   # disable cutoff for this test
         "history_days": 1,
         "bar_limit": 500,
         "feed": "iex",
         "qty": 1,
     }
 
-    # --- Mocks for data path (patch BOTH import site and source module) ---
-    # (a) bars
-    monkeypatch.setattr(
-        live,
-        "get_alpaca_bars",
-        lambda key, secret, tf, s, start, end, feed="iex", limit=500: _make_bars(close=50.0, atr=0.5),
-    )
-
-    # (b) RTH / drop bar: hard-bypass anywhere they might be referenced
+    # --- Minimal mocks to jump straight to order placement ---
+    # Bypass bar-prep entirely (avoids tz-localize paths)
+    monkeypatch.setattr(live, "get_alpaca_bars", lambda *a, **kw: pd.DataFrame())
+    # Keep these as no-ops (not used because df is empty, but safe)
     monkeypatch.setattr(live, "filter_rth", lambda df, **kw: df)
     monkeypatch.setattr(live, "drop_unclosed_last_bar", lambda df, tf: df)
-    monkeypatch.setattr(data_mod, "filter_rth", lambda df, **kw: df)
-    monkeypatch.setattr(data_mod, "drop_unclosed_last_bar", lambda df, tf: df)
 
-    # (c) indicators/signal
+    # Pretend signal & gating are always long/ok
     monkeypatch.setattr(live, "compute_indicators", lambda df, cfg: df)
-    monkeypatch.setattr(live, "crossover", lambda df: 1)  # signal = long
-
-    # (d) gating
+    monkeypatch.setattr(live, "crossover", lambda df: 1)
     monkeypatch.setattr(live, "long_ok", lambda df, cfg: True)
     monkeypatch.setattr(live, "explain_long_gate", lambda df, cfg: {"ok": True})
 
-    # (e) positions & open orders
-    monkeypatch.setattr(live, "get_positions", lambda base, key, sec: {})  # no open position
-    monkeypatch.setattr(live, "get_open_orders", lambda base, key, sec, symbol=None: [])
+    # No existing positions/orders
+    monkeypatch.setattr(live, "get_positions", lambda *a, **kw: {})
+    monkeypatch.setattr(live, "get_open_orders", lambda *a, **kw: [])
 
-    # creds
+    # creds env for _alpaca_creds
     monkeypatch.setenv("ALPACA_API_KEY", "k")
     monkeypatch.setenv("ALPACA_API_SECRET", "s")
     monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-    # (f) submit that throws 422 — patch at import site
-    def boom(*a, **kw):
-        raise Exception("422 Unprocessable Entity: bracket spacing")
-
+    # Force a 422 on submit
+    def boom(*a, **kw): raise Exception("422 Unprocessable Entity")
     monkeypatch.setattr(live, "submit_bracket_order", boom)
 
-    # Run once → should set cooldown
     args = types.SimpleNamespace(dry_run=0)
     live.manage_symbol(sym, cfg, args)
 
-    # Cooldown was set
     assert sym in live._ERROR_COOLDOWN, "422 should place symbol on cooldown"
 
-    # Run again → should skip due to cooldown
+    # second call should skip due to cooldown
     live.manage_symbol(sym, cfg, args)
     out = capsys.readouterr().out
-    assert "on error cooldown" in out, "second attempt should skip due to cooldown"
+    assert "on error cooldown" in out
 
 #
 # ---------- Test 3: Breakeven stop bump ----------
