@@ -19,7 +19,7 @@ jobs:
       - name: Install deps
         run: |
           & "$env:PYTHON_EXE" -m pip install --upgrade pip
-          # install project deps
+          # project deps
           if (Test-Path "EMAMerged\requirements.txt") {
             & "$env:PYTHON_EXE" -m pip install -r EMAMerged/requirements.txt
           } else {
@@ -31,11 +31,25 @@ jobs:
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
 
+      - name: Use UTF-8 (Windows)
+        run: chcp 65001 > $null
+
       - name: Run guardrails tests only
         env:
-          # dummy creds to satisfy any import-time checks
           ALPACA_API_KEY: "test"
           ALPACA_API_SECRET: "test"
           ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
         run: |
           & "$env:PYTHON_EXE" -m pytest -k guardrails -q
+
+      - name: Run filters contract test
+        env:
+          ALPACA_API_KEY: "test"
+          ALPACA_API_SECRET: "test"
+          ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+        run: |
+          if (Test-Path "tests\test_filters_contract.py") {
+            & "$env:PYTHON_EXE" -m pytest -q tests/test_filters_contract.py
+          } else {
+            Write-Host "Skipping filters contract test (file not present)."
+          }
