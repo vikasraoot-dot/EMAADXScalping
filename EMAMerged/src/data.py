@@ -52,17 +52,37 @@ def get_alpaca_bars(
     secret: str,
     timeframe: str,
     symbol: str,
-    start: dt.datetime,
-    end: dt.datetime,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+    *,
+    # Backward-compatible convenience args (used by your backtester)
+    days: int | None = None,
+    history_days: int | None = None,
     feed: str = "iex",
     limit: int = 500,
+    adjustment: str = "raw",
+    **_ignore: Any,  # safely swallow any unknown kwargs from older callers
 ) -> pd.DataFrame:
-    # v2/data/bars endpoint
-    tf = timeframe
+    """
+    Fetch bars from Alpaca v2. Accepts either explicit start/end OR a days/history_days lookback.
+    Backtester passes history_days=30; live code usually passes explicit start/end.
+    """
+    # Resolve lookback window
+    if start is None or end is None:
+        lookback = days if days is not None else history_days
+        if lookback is None:
+            lookback = 30  # sensible default
+        end = _now_utc()
+        start = end - dt.timedelta(days=int(lookback))
+
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     params = {
-        "timeframe": tf, "start": _iso(start), "end": _iso(end),
-        "adjustment": "raw", "feed": feed, "limit": limit
+        "timeframe": timeframe,
+        "start": _iso(start),
+        "end": _iso(end),
+        "adjustment": adjustment,
+        "feed": feed,
+        "limit": int(limit),
     }
     r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=20, params=params)
     js = r.json()
@@ -70,6 +90,7 @@ def get_alpaca_bars(
     if not bars:
         return pd.DataFrame()
     df = pd.DataFrame(bars)
+    # Normalize schema
     df["t"] = pd.to_datetime(df["t"], utc=True)
     df = df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
     df = df.set_index("time").sort_index()
