@@ -12,7 +12,16 @@ import pytest
 #
 
 def _utc_now():
-    return pd.Timestamp.utcnow().tz_localize("UTC")
+    """Return a UTC-aware Timestamp, robust across pandas versions."""
+    ts = pd.Timestamp.utcnow()
+    # Some pandas versions return tz-aware here; others return naive.
+    if getattr(ts, "tzinfo", None) is None:
+        return ts.tz_localize("UTC")
+    try:
+        return ts.tz_convert("UTC")
+    except Exception:
+        # Fallback: ensure UTC tz
+        return pd.Timestamp.now(tz="UTC")
 
 def _make_bars(periods=3, tf_minutes=15, close=100.0, atr=0.8):
     """Small 15m bar DataFrame with ATR column present."""
@@ -173,7 +182,6 @@ def test_guardrails_breakeven_bump_updates_stop(monkeypatch):
     last = 100.10  # >= entry + 0.5R ⇒ triggers bump
 
     # Call the internal helper directly
-    import math
     live._maybe_breakeven_bump("XYZ", cfg, entry, r_dist, last)
 
     assert patched["patched"] is True, "patch_order should be called once"
