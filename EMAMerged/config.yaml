@@ -6,53 +6,35 @@ rth_only: true
 rth_start: "09:30"
 rth_end:   "15:55"
 
-# Live cadence as requested
+# Live cadence
 timeframe: "15Min"
 history_days: 30
 bar_limit: 10000
 feed: "iex"
 
-
-# Block NEW entries N minutes before close
-no_new_entries_last_min: 10
-
-# CORE STRATEGY PARAMETERS
-ema_fast: 9
-ema_slow: 21
-atr_period: 14
-
-# FILTERS (all must pass to enter long)
-filters:
-  # ADX / DI
-  adx_period: 14
-  adx_threshold: 22           # you had 23 in your current config; say the word if you want 22
-  # RSI
-  rsi_period: 14
-  rsi_min: 45                 # was 45; raise/lower to taste (can override via dispatch)
-  rsi_max: 80
-  # EMA slope (percent-of-price)
-  slope_threshold_pct: 0.0008 # 08 bps per bar
-  # Optional quality gates
-  min_price: 10.0
-  min_dollar_vol: 1000000
-  dollar_vol_window: 20
-
-  # MTF bias
-  mtf_bias:
-    enabled: false         # set false to disable everywhere
-    timeframe: "60Min"    # higher timeframe to check
-    lookback_align: 1     # how many HTF bars to shift for confirmation
+# Risky behaviors mitigations
+flatten_minutes_before_close: 5     # A: force flatten positions this many minutes before close
+entry_cutoff_min: 20                # A: block NEW entries within last N minutes
 
 # POSITION / RISK
 allow_shorts: false
-qty: 1                        # ALWAYS 1 share per entry
-max_notional_per_trade: 2000  # skip entry when price > $2,000
+qty: 1
+max_notional_per_trade: 2000
 
 # BRACKET ORDERS
 brackets:
   enabled: true
-  atr_mult_sl: 1.0            # stop distance = 1.2 * ATR
-  take_profit_r: 1.2          # TP at +1R (R = entry price − stop price)
+  atr_mult_sl: 1.0            # stop distance = 1.0 * ATR
+  take_profit_r: 1.2          # TP at +1.2R
+
+# Optional: breakeven bump (single move to BE+ticks at +0.5R)
+breakeven:
+  enabled: true
+  trigger_r: 0.5              # trigger when ≥ 0.5R
+  bump_ticks: 2               # move stop to entry + 2 ticks
+  tick_size: 0.01             # $0.01/tick
 
 # OUTPUT
 results_dir: "results"
+
+# Tickers file still used by market_loop unless SYMBOLS override
