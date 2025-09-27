@@ -1,0 +1,41 @@
+name: EMA Guardrails Tests (Windows)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  guardrails:
+    runs-on: [self-hosted, windows]
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Python path
+        run: echo "PYTHON_EXE=C:\Program Files\Python313\python.exe" >> $env:GITHUB_ENV
+
+      - name: Install deps
+        run: |
+          & "$env:PYTHON_EXE" -m pip install --upgrade pip
+          # install project deps
+          if (Test-Path "EMAMerged\requirements.txt") {
+            & "$env:PYTHON_EXE" -m pip install -r EMAMerged/requirements.txt
+          } else {
+            & "$env:PYTHON_EXE" -m pip install pandas requests pyyaml pytz
+          }
+          # test deps
+          & "$env:PYTHON_EXE" -m pip install pytest requests-mock
+
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+
+      - name: Run guardrails tests only
+        env:
+          # dummy creds to satisfy any import-time checks
+          ALPACA_API_KEY: "test"
+          ALPACA_API_SECRET: "test"
+          ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+        run: |
+          & "$env:PYTHON_EXE" -m pytest -k guardrails -q
