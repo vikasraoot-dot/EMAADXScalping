@@ -128,7 +128,11 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
     close = float(df["close"].iat[-1])
 
     # C) Log the last CLOSED bar time (bar timestamp), not wall-clock
-    bar_ts = df.index[-1].tz_convert(pytz.timezone(tz)).strftime("%Y-%m-%d %H:%M")
+    try:
+        bar_ts = df.index[-1].tz_convert(pytz.timezone(tz)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        # Fallback for rare tz-naive indices
+        bar_ts = pd.to_datetime(df.index[-1]).strftime("%Y-%m-%d %H:%M")
     print(f"[{sym}] {bar_ts} close={round2(close)} cross={x}")
 
     # Positions / open orders
@@ -161,16 +165,19 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
         except Exception as e:
             print(f"[{sym}] cutoff check error: {e}")
 
-    # Long entry path
-    if qty_open == 0 and x == 1 and long_ok(df, cfg):
-        reasons = explain_long_gate(df, cfg)
-        if reasons:
-            print(f"[{sym}] gate reasons: {reasons}")
+    # ----- CHG 1: evaluate gates on the last bar (Series), not the whole DataFrame -----
+    last_row = df.iloc[-1]
+    reasons = explain_long_gate(last_row, cfg)
+    if reasons:
+        print(f"[{sym}] gate reasons: {reasons}")
 
+    # Long entry path
+    if qty_open == 0 and x == 1 and long_ok(last_row, cfg):  # CHG 2: pass Series
         qty = int(cfg.get("qty", 1) or 1)
         max_notional = float(cfg.get("max_notional_per_trade", 0) or 0.0)
-        if max_notional > 0 and close > max_notional:
-            print(f"[{sym}] skip: price {round2(close)} exceeds notional cap {round2(max_notional)}")
+        # ----- CHG 3: cap by true notional (qty * price) -----
+        if max_notional > 0 and (qty * close) > max_notional:
+            print(f"[{sym}] skip: notional {round2(qty*close)} exceeds cap {round2(max_notional)}")
             return
 
         # Brackets?
@@ -191,7 +198,7 @@ def manage_symbol(sym: str, cfg: dict, args) -> None:
         coid = f"EMA-ENTRY-{sym}-{df.index[-1].strftime('%Y%m%d%H%M')}"
 
         if args.dry_run:
-            print(f"[{sym}] DRY ENTRY qty=1 price~{round2(close)} stop~{round2(stop_price)} tp~{round2(tp_price)}")
+            print(f"[{sym}] DRY ENTRY qty={qty} price~{round2(close)} stop~{round2(stop_price)} tp~{round2(tp_price)}")
         else:
             try:
                 if use_brackets:
