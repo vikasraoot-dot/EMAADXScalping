@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo
 except Exception:
-    # py<3.9 fallback (not expected for your runner, but harmless)
     from backports.zoneinfo import ZoneInfo  # type: ignore
+import yaml  # added
 
 ET  = ZoneInfo("US/Eastern")
 UTC = ZoneInfo("UTC")
@@ -31,7 +31,7 @@ def market_close_et(d: datetime | None = None) -> datetime:
 
 def seconds_until_next_5m(d_utc: datetime | None = None) -> int:
     """
-    Sleep to the next 5-minute boundary in UTC. This aligns loops to :00/:05/:10…
+    Sleep to the next 5-minute boundary in UTC. Aligns loops to :00/:05/:10…
     Min 1s to keep loops tight if called right after a boundary.
     """
     d = (d_utc or datetime.now(UTC)).replace(tzinfo=UTC)
@@ -51,7 +51,6 @@ def run_once():
     We prefer the tickers file by default; symbols can still be passed via env.
     """
     py = sys.executable
-    repo_root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
     cfg = os.environ.get("EMA_CONFIG", "EMAMerged/config.yaml")
     tickers = os.environ.get("EMA_TICKERS_FILE", "EMAMerged/tickers.txt")
     symbols = os.environ.get("SYMBOLS", "").strip()
@@ -65,18 +64,28 @@ def run_once():
         args += ["--tickers", tickers]
     args += ["--dry-run", dry, "--force-run", force]
 
-    print(f"[loop] launching live_paper_loop (symbols={'custom' if symbols else 'file'}, dry={dry}, force={force})", flush=True)
-    proc = subprocess.run(args, cwd=repo_root)
-    print(f"[loop] live_paper_loop exit code={proc.returncode}", flush=True)
+    print(f"[loop] invoking: {py} {' '.join(args[1:])}", flush=True)
+    rc = subprocess.run(args, check=False).returncode
+    print(f"[loop] live_paper_loop exit code={rc}", flush=True)
+
+def _load_cfg(path="EMAMerged/config.yaml"):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
 
 def main():
     fast_loop = os.environ.get("FAST_LOOP", "0") == "1"
+    cfg_path = os.environ.get("EMA_CONFIG", "EMAMerged/config.yaml")
+    cfg = _load_cfg(cfg_path)
+    flatten_mins = int(cfg.get("flatten_minutes_before_close", 5))
+    flattened_today = False
 
     print("[loop] starting EMAADXScalping AM loop (15m strategy; check every 5m)", flush=True)
     while True:
         d = now_et()
         if not is_weekday(d):
-            # weekend: sleep to next 5m boundary, keep logs flowing
             secs = seconds_until_next_5m()
             print(f"[loop] weekend; sleep {secs}s", flush=True)
             time.sleep(secs)
@@ -84,7 +93,6 @@ def main():
 
         mo, mc = market_open_et(d), market_close_et(d)
         if d < mo:
-            # Pre-open: sleep until the next 5m tick, or to open if closer
             secs_to_open = int((mo - d).total_seconds())
             secs_5m = seconds_until_next_5m()
             secs = min(secs_to_open, secs_5m)
@@ -92,11 +100,21 @@ def main():
             time.sleep(secs)
             continue
 
+        # EOD flatten once flatten_mins before close
+        if not flattened_today:
+            mins_to_close = (mc - d).total_seconds() / 60.0
+            if mins_to_close <= flatten_mins:
+                print(f"[loop] within {flatten_mins}m of close → EOD flatten", flush=True)
+                try:
+                    subprocess.run([sys.executable, "-u", "EMAMerged/scripts/flat_eod.py"], check=False)
+                    flattened_today = True
+                except Exception as e:
+                    print(f"[loop] EOD flatten error: {e}", flush=True)
+
         if d >= mc:
             print(f"[loop] reached market close {mc.strftime('%H:%M %Z')} → exiting loop", flush=True)
             break
 
-        # In RTH: run once, then sleep to the next 5m boundary (or 1s if FAST_LOOP)
         try:
             run_once()
         except Exception as e:
@@ -107,7 +125,6 @@ def main():
         time.sleep(secs)
 
 if __name__ == "__main__":
-    # ensure immediate flushing
     try:
         import functools as _f
         print = _f.partial(print, flush=True)  # type: ignore
