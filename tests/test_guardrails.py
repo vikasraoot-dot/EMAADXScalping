@@ -7,12 +7,10 @@ import types
 import pandas as pd
 import datetime as dt
 import pytz
-import builtins
-
 import pytest
 
 #
-# ---------- Utilities ----------
+# ---------- helpers ----------
 #
 
 def _utc_now():
@@ -53,13 +51,14 @@ def test_guardrails_eod_flatten_invokes_cancel_and_close(monkeypatch):
         called["close"] += 1
         return {}
 
-    # monkeypatch credentials and data-layer calls
+    # monkeypatch credentials
     monkeypatch.setenv("ALPACA_API_KEY", "k")
     monkeypatch.setenv("ALPACA_API_SECRET", "s")
     monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-    monkeypatch.setattr("EMAMerged.src.data.cancel_all_orders", fake_cancel)
-    monkeypatch.setattr("EMAMerged.src.data.close_all_positions", fake_close)
+    # IMPORTANT: patch at the import site (flat_eod module), not src.data
+    monkeypatch.setattr(flat, "cancel_all_orders", fake_cancel)
+    monkeypatch.setattr(flat, "close_all_positions", fake_close)
 
     flat.main()
 
@@ -75,7 +74,6 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     Simulate a long entry that raises a 422 on bracket submit.
     Verify the symbol is put on a 15m cooldown and subsequent attempt skips.
     """
-    # Light imports
     import EMAMerged.scripts.live_paper_loop as live
 
     sym = "TEST"
@@ -98,34 +96,36 @@ def test_guardrails_422_cooldown_sets_and_skips(monkeypatch, capsys):
     # --- Mocks for data path ---
     # (a) bars
     monkeypatch.setattr(
-        "EMAMerged.src.data.get_alpaca_bars",
+        live,  # patch at import site
+        "get_alpaca_bars",
         lambda key, secret, tf, s, start, end, feed="iex", limit=500: _make_bars(close=50.0, atr=0.5),
     )
     # (b) RTH / drop bar: pass-through
-    monkeypatch.setattr("EMAMerged.src.data.filter_rth", lambda df, **kw: df)
-    monkeypatch.setattr("EMAMerged.src.data.drop_unclosed_last_bar", lambda df, tf: df)
+    monkeypatch.setattr(live, "filter_rth", lambda df, **kw: df)
+    monkeypatch.setattr(live, "drop_unclosed_last_bar", lambda df, tf: df)
 
     # (c) indicators/signal
-    monkeypatch.setattr("EMAMerged.src.strategy.compute_indicators", lambda df, cfg: df)
-    monkeypatch.setattr("EMAMerged.src.strategy.crossover", lambda df: 1)  # signal = long
+    monkeypatch.setattr(live, "compute_indicators", lambda df, cfg: df)
+    monkeypatch.setattr(live, "crossover", lambda df: 1)  # signal = long
 
     # (d) gating
-    monkeypatch.setattr("EMAMerged.src.filters.long_ok", lambda df, cfg: True)
-    monkeypatch.setattr("EMAMerged.src.filters.explain_long_gate", lambda df, cfg: {"ok": True})
+    monkeypatch.setattr(live, "long_ok", lambda df, cfg: True)
+    monkeypatch.setattr(live, "explain_long_gate", lambda df, cfg: {"ok": True})
 
     # (e) positions & open orders
-    monkeypatch.setattr("EMAMerged.src.data.get_positions", lambda base, key, sec: {})  # no open position
-    monkeypatch.setattr("EMAMerged.src.data.get_open_orders", lambda base, key, sec, symbol=None: [])
+    monkeypatch.setattr(live, "get_positions", lambda base, key, sec: {})  # no open position
+    monkeypatch.setattr(live, "get_open_orders", lambda base, key, sec, symbol=None: [])
 
-    # (f) creds and submit that throws 422
+    # creds
     monkeypatch.setenv("ALPACA_API_KEY", "k")
     monkeypatch.setenv("ALPACA_API_SECRET", "s")
     monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
+    # (f) submit that throws 422 — patch at import site
     def boom(*a, **kw):
         raise Exception("422 Unprocessable Entity: bracket spacing")
 
-    monkeypatch.setattr("EMAMerged.src.data.submit_bracket_order", boom)
+    monkeypatch.setattr(live, "submit_bracket_order", boom)
 
     # Run once → should set cooldown
     args = types.SimpleNamespace(dry_run=0)
@@ -149,12 +149,12 @@ def test_guardrails_breakeven_bump_updates_stop(monkeypatch, capsys):
     """
     import EMAMerged.scripts.live_paper_loop as live
 
-    # Provide creds (won't be used for network, but required)
+    # Provide creds (for _alpaca_creds in helper)
     monkeypatch.setenv("ALPACA_API_KEY", "k")
     monkeypatch.setenv("ALPACA_API_SECRET", "s")
     monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-    # Mock list_open_orders returning a stop order for our symbol
+    # Mock list_open_orders & patch_order AT THE IMPORT SITE
     stop_order = {"id": "abc123", "symbol": "XYZ", "side": "sell", "type": "stop", "stop_price": 100.00}
 
     def fake_list(base, key, secret, symbols=None):
@@ -167,8 +167,8 @@ def test_guardrails_breakeven_bump_updates_stop(monkeypatch, capsys):
         patched["stop_price"] = fields.get("stop_price")
         return {"id": order_id, **fields}
 
-    monkeypatch.setattr("EMAMerged.src.data.list_open_orders", fake_list)
-    monkeypatch.setattr("EMAMerged.src.data.patch_order", fake_patch)
+    monkeypatch.setattr(live, "list_open_orders", fake_list)
+    monkeypatch.setattr(live, "patch_order", fake_patch)
 
     # Config for breakeven
     cfg = {
