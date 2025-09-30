@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, sys, argparse
+import os, sys, argparse, time
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
@@ -13,282 +13,111 @@ from EMAMerged.src.data import (
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok, explain_long_gate
 
+# NEW: logger + Alpaca helpers (no churn in data.py)
+from EMAMerged.src.trade_logger import TradeLogger
+from EMAMerged.src.alpaca_extensions import get_order, get_activities
+
 # -------------------------
-# Env helpers / overrides
-# -------------------------
-def _env(name: str, default: str = "") -> str:
-    v = os.environ.get(name)
-    return v if v is not None else default
+# Minimal globals—kept tiny to reduce churn
+_ERROR_COOLDOWN = {}  # sym -> until_dt
+LAST_ACTIVITY_TS = None  # for FILL polling
+OPEN_TRADES = {}  # cid -> dict(symbol, parent_id, tp_id, sl_id, entry_price, qty, tp, sl)
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        s = _env(name, "")
-        return int(s) if s.strip() else default
-    except:
-        return default
+def _cfg_bool(cfg: dict, path: str, default: bool) -> bool:
+    cur = cfg
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur: return default
+        cur = cur[k]
+    return bool(cur)
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        s = _env(name, "")
-        return float(s) if s.strip() else default
-    except:
-        return default
-
-def _alpaca_creds():
-    key = _env("ALPACA_API_KEY") or _env("ALPACA_KEY")
-    secret = _env("ALPACA_API_SECRET") or _env("ALPACA_SECRET")
-    base = _env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+def _alpaca_env(cfg: dict):
+    key = os.environ.get("ALPACA_KEY") or cfg.get("alpaca", {}).get("key")
+    secret = os.environ.get("ALPACA_SECRET") or cfg.get("alpaca", {}).get("secret")
+    base_url = os.environ.get("APCA_BASE_URL") or cfg.get("alpaca", {}).get("base_url", "https://paper-api.alpaca.markets")
     if not key or not secret:
-        raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
-    return base, key, secret
+        raise RuntimeError("Alpaca API credentials not found (env or config).")
+    return base_url, key, secret
 
-def _results_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+def _build_cid(sym: str) -> str:
+    now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"EMA_{sym}_{now}"
 
-def _append_csv(path: str, row: dict):
-    df = pd.DataFrame([row])
-    header = not os.path.exists(path)
-    df.to_csv(path, mode="a", index=False, header=header)
+def _now_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-_ERROR_COOLDOWN = {}  # sym -> datetime until retries allowed on 422
+def _poll_until_filled(base_url, key, secret, order_id, timeout_s=30, sleep_s=1):
+    """Poll order until filled/canceled or timeout; returns order JSON."""
+    t0 = time.time()
+    last = None
+    while time.time() - t0 < timeout_s:
+        ordj = get_order(base_url, key, secret, order_id)
+        last = ordj
+        st = (ordj or {}).get("status")
+        if st in ("filled", "partially_filled", "canceled", "rejected"):
+            return ordj
+        time.sleep(sleep_s)
+    return last
 
-# -------------------------
-# Optional: breakeven bump helper
-# -------------------------
-def _maybe_breakeven_bump(sym: str, cfg: dict, entry_price: float, r_dist: float, last_price: float):
-    be = cfg.get("breakeven", {}) or {}
-    if not be.get("enabled", True):
-        return
-    if r_dist <= 0:
-        return
-
-    trigger_r = float(be.get("trigger_r", 0.5))
-    tick = float(be.get("tick_size", 0.01))
-    bump_ticks = int(be.get("bump_ticks", 2))
-    bump_price = round2(entry_price + bump_ticks * tick)
-
-    r_mult = (last_price - entry_price) / r_dist
-    if r_mult < trigger_r:
-        return
-
-    base, key, secret = _alpaca_creds()
-    # find open stop for this symbol; nested open orders lists children
+def _log_snapshot(logger: TradeLogger, base_url, key, secret):
     try:
-        orders = list_open_orders(base, key, secret, symbols=[sym])
+        pos = get_positions(base_url, key, secret)
+        snap = [{"symbol": p["symbol"], "side": p["side"], "qty": float(p.get("qty", 0)),
+                 "avg_price": float(p.get("avg_entry_price", 0)), "market": float(p.get("market_value", 0))}
+                for p in pos.values()] if isinstance(pos, dict) else []
+        logger.snapshot(session="AMPM", open_positions=snap)
     except Exception as e:
-        print(f"[{sym}] breakeven list orders error: {e}")
+        logger.error(stage="SNAPSHOT", error_code="SNAPSHOT_FAIL", error_text=str(e))
+
+def manage_symbol(sym: str, cfg: dict, args, logger: TradeLogger):
+    base_url, key, secret = _alpaca_env(cfg)
+
+    # A) bars & indicators (unchanged pattern)
+    bars = get_alpaca_bars(base_url, key, secret, sym, timeframe=cfg["data"]["timeframe"], days=int(cfg["data"]["days"]))
+    if bars is None or len(bars) < 40:
+        return
+    bars = filter_rth(bars)
+    bars = drop_unclosed_last_bar(bars)
+    df = compute_indicators(bars, cfg)
+    row = df.iloc[-1]
+
+    # B) signal
+    cross = crossover(df, cfg)
+    ok = long_ok(row, cfg)
+    gates = {"adx_ok": True, "ema_ok": True, "dvol_ok": True}  # filters already check; keep brief
+    cid = _build_cid(sym)
+    logger.signal(symbol=sym, session="AMPM", cid=cid, tf=cfg["data"]["timeframe"],
+                  cross=int(cross), close=float(row["close"]),
+                  ref_bar={"t": str(df.index[-1]), "o": float(row["open"]), "h": float(row["high"]),
+                           "l": float(row["low"]), "c": float(row["close"]), "v": float(row.get("volume", 0))},
+                  gates=gates, decision=("ENTER_LONG" if (cross and ok) else "PASS"))
+    if not (cross and ok):
         return
 
-    stop_os = [o for o in orders
-               if o.get("symbol") == sym
-               and o.get("side") == "sell"
-               and (o.get("type") in ("stop", "stop_limit"))]
-    if not stop_os:
-        return
+    # C) bracket levels
+    bcfg = cfg.get("brackets", {})
+    tp = round2(row["close"] * (1.0 + float(bcfg.get("tp_pct", 0.003))))
+    sl = round2(row["close"] * (1.0 - float(bcfg.get("sl_pct", 0.003))))
+    qty = int(max(1, bcfg.get("qty", 1)))
 
-    stop_o = stop_os[0]
-    cur_stop = float(stop_o.get("stop_price") or 0.0)
-    if bump_price <= cur_stop:
-        return
+    # D) sequencing strategy
+    single_call_bracket = _cfg_bool(cfg, "orders.single_call_bracket", True)
 
-    try:
-        patch_order(base, key, secret, stop_o["id"], stop_price=bump_price)
-        print(f"[{sym}] breakeven bump: stop {cur_stop} → {bump_price} (r={r_mult:.2f})", flush=True)
-    except Exception as e:
-        print(f"[{sym}] breakeven bump error: {e}", flush=True)
-
-# -------------------------
-# Main per-symbol routine
-# -------------------------
-def manage_symbol(sym: str, cfg: dict, args) -> None:
-    base, key, secret = _alpaca_creds()
-    tz = cfg.get("timezone", "US/Eastern")
-    tf = cfg.get("timeframe", "5Min")
-    feed = cfg.get("feed", "iex")
-    hist_days = int(cfg.get("history_days", 30))
-    limit = int(cfg.get("bar_limit", 500))
-
-    # Fetch bars
-    try:
-        end = new_york_now()
-        start = end - timedelta(days=hist_days)
-        df = get_alpaca_bars(key, secret, tf, sym, start, end, feed=feed, limit=limit)
-        if bool(cfg.get("rth_only", True)):
-            df = filter_rth(df, tz_name=tz, rth_start=cfg.get("rth_start","09:30"), rth_end=cfg.get("rth_end","15:55"))
-        df = drop_unclosed_last_bar(df, tf)
-        if df.empty:
-            print(f"[{sym}] no bars")
-            return
-    except Exception as e:
-        print(f"[{sym}] bars error: {e}")
-        return
-
-    df = compute_indicators(df, cfg)
-    x = crossover(df)
-    close = float(df["close"].iat[-1])
-
-    # C) Log the last CLOSED bar time (bar timestamp), not wall-clock
-    try:
-        bar_ts = df.index[-1].tz_convert(pytz.timezone(tz)).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        # Fallback for rare tz-naive indices
-        bar_ts = pd.to_datetime(df.index[-1]).strftime("%Y-%m-%d %H:%M")
-    print(f"[{sym}] {bar_ts} close={round2(close)} cross={x}")
-
-    # Positions / open orders
-    try:
-        positions = get_positions(base, key, secret)
-    except Exception as e:
-        print(f"[{sym}] positions error: {e}")
-        return
-    try:
-        open_orders = get_open_orders(base, key, secret, symbol=sym)
-    except Exception as e:
-        print(f"[{sym}] open-orders error: {e}")
-        open_orders = []
-
-    qty_open = int(float(positions.get(sym, {}).get("qty", "0") or 0))
-    side_open = "long" if qty_open > 0 else ("short" if qty_open < 0 else None)
-
-    # A) Late entry cutoff: no NEW entries within last N minutes
-    if qty_open == 0 and x == 1 and cfg.get("entry_cutoff_min", 0):
+    if single_call_bracket:
+        # Safer: one bracket order → no “insufficient qty”
+        logger.entry_submit(symbol=sym, session="AMPM", cid=cid, side="BUY",
+                            qty=qty, order_type="market",
+                            intended={"tp": tp, "sl": sl})
         try:
-            et_tz = pytz.timezone(tz)
-            now_et = new_york_now().astimezone(et_tz)
-            rth_end = datetime.strptime(cfg.get("rth_end","15:55"), "%H:%M").time()
-            rth_end_dt = now_et.replace(hour=rth_end.hour, minute=rth_end.minute, second=0, microsecond=0)
-            remaining = (rth_end_dt - now_et).total_seconds() / 60.0
-            cutoff = int(cfg.get("entry_cutoff_min", 20))
-            if remaining <= cutoff:
-                print(f"[{sym}] skip entry: {remaining:.0f}m to close ≤ cutoff {cutoff}m")
-                return
-        except Exception as e:
-            print(f"[{sym}] cutoff check error: {e}")
-
-    # ----- CHG 1: evaluate gates on the last bar (Series), not the whole DataFrame -----
-    last_row = df.iloc[-1]
-    reasons = explain_long_gate(last_row, cfg)
-    if reasons:
-        print(f"[{sym}] gate reasons: {reasons}")
-
-    # Long entry path
-    if qty_open == 0 and x == 1 and long_ok(last_row, cfg):  # CHG 2: pass Series
-        qty = int(cfg.get("qty", 1) or 1)
-        max_notional = float(cfg.get("max_notional_per_trade", 0) or 0.0)
-        # ----- CHG 3: cap by true notional (qty * price) -----
-        if max_notional > 0 and (qty * close) > max_notional:
-            print(f"[{sym}] skip: notional {round2(qty*close)} exceeds cap {round2(max_notional)}")
-            return
-
-        # Brackets?
-        brackets_cfg = cfg.get("brackets", {})
-        use_brackets = bool(brackets_cfg.get("enabled", True))
-
-        # Compute SL/TP using ATR R multiple — B) harden spacing
-        atr_mult = float(brackets_cfg.get("atr_mult_sl", 1.2))
-        take_r  = float(brackets_cfg.get("take_profit_r", 1.0))
-        atr_val = float(df["atr"].iat[-1]) if "atr" in df.columns else 0.0
-        r_dist  = max(0.02, atr_mult * atr_val)  # ≥ $0.02 (two ticks) risk
-        stop_price = max(0.01, close - r_dist)
-        tp_price   = close + take_r * r_dist
-        if tp_price <= close + 0.01:
-            tp_price = close + 0.02
-
-        # idempotent COID
-        coid = f"EMA-ENTRY-{sym}-{df.index[-1].strftime('%Y%m%d%H%M')}"
-
-        if args.dry_run:
-            print(f"[{sym}] DRY ENTRY qty={qty} price~{round2(close)} stop~{round2(stop_price)} tp~{round2(tp_price)}")
-        else:
-            try:
-                if use_brackets:
-                    submit_bracket_order(
-                        base, key, secret,
-                        symbol=sym, qty=qty, side="buy",
-                        entry_type="market", client_order_id=coid,
-                        take_profit_price=tp_price, stop_price=stop_price, stop_limit_price=None
-                    )
-                else:
-                    submit_market_order(base, key, secret, sym, qty=qty, side="buy", client_order_id=coid)
-                print(f"[{sym}] ENTRY BUY qty={qty} @ ~{round2(close)} (brackets={use_brackets})")
-            except Exception as e:
-                msg = str(e)
-                print(f"[{sym}] entry error: {msg}")
-                # B) 422 cooldown (15m)
-                if "422" in msg or "Unprocessable" in msg:
-                    _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=15)
-                return
-
-    # If we have a position, optionally try breakeven bump
-    if qty_open > 0:
-        try:
-            pos = positions.get(sym)
-            entry_price = float(pos["avg_entry_price"]) if pos else 0.0
-            # approximate r_dist using the same ATR logic used above
-            atr_val = float(df["atr"].iat[-1]) if "atr" in df.columns else 0.0
-            atr_mult = float(cfg.get("brackets", {}).get("atr_mult_sl", 1.2))
-            r_dist  = max(0.02, atr_mult * atr_val)
-            _maybe_breakeven_bump(sym, cfg, entry_price, r_dist, last_price=close)
-        except Exception as e:
-            print(f"[{sym}] breakeven check error: {e}")
-
-    # Snapshot
-    try:
-        results_dir = cfg.get("results_dir", "results")
-        _results_dir(results_dir)
-        pos = positions.get(sym)
-        row = {
-            "ts": df.index[-1].isoformat(),
-            "symbol": sym,
-            "qty": int(float(pos["qty"])) if pos else 0,
-            "avg_entry_price": float(pos["avg_entry_price"]) if pos else 0.0,
-            "market_price": round2(close),
-        }
-        _append_csv(os.path.join(results_dir,"live_positions.csv"), row)
-    except Exception as e:
-        print(f"[{sym}] positions snapshot error: {e}")
-
-# -------------------------
-# CLI
-# -------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="EMAMerged/config.yaml")
-    ap.add_argument("--tickers", default="EMAMerged/tickers.txt")
-    ap.add_argument("--symbols", default="")
-    ap.add_argument("--dry-run", type=int, default=int(os.environ.get("DRY_RUN", "0")))
-    ap.add_argument("--force-run", type=int, default=int(os.environ.get("FORCE_RUN", "0")))
-    args = ap.parse_args()
-
-    cfg = load_config(args.config)
-
-    # Market-hours gate unless forced
-    base, key, secret = _alpaca_creds()
-    if not args.force_run:
-        try:
-            from EMAMerged.src.data import alpaca_market_open
-            if not alpaca_market_open(base, key, secret):
-                print("[GATE] Market closed; exiting.")
-                return
-        except Exception as e:
-            print(f"[GATE] clock error: {e}")
-            return
-
-    if args.symbols.strip():
-        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    else:
-        symbols = read_tickers(args.tickers)
-
-    for sym in symbols:
-        try:
-            # B) per-symbol cooldown check
-            until = _ERROR_COOLDOWN.get(sym)
-            if until and new_york_now() < until:
-                print(f"[{sym}] on error cooldown until {until.strftime('%H:%M')} (skip)")
-                continue
-            manage_symbol(sym, cfg, args)
-        except Exception as e:
-            print(f"[{sym}] fatal: {e}")
-
-if __name__ == "__main__":
-    main()
+            res = submit_bracket_order(base_url, key, secret, symbol=sym, qty=qty,
+                                       side="buy", order_type="market",
+                                       take_profit={"limit_price": tp},
+                                       stop_loss={"stop_price": sl})
+            parent_id = res.get("id")
+            legs = res.get("legs") or []
+            tp_id = next((l.get("id") for l in legs if l.get("side") == "sell" and l.get("type") == "limit"), None)
+            sl_id = next((l.get("id") for l in legs if l.get("side") == "sell" and l.get("type") == "stop"), None)
+            logger.entry_ack(symbol=sym, session="AMPM", cid=cid, client_order_id=res.get("client_order_id"),
+                             broker_order_id=parent_id, status=res.get("status","?"))
+            if tp_id or sl_id:
+                logger.oco_ack(symbol=sym, session="AMPM", cid=cid, oco_client_id=None,
+                               tp
