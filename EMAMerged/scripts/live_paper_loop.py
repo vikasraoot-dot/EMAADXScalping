@@ -15,6 +15,11 @@ from EMAMerged.src.filters import long_ok, explain_long_gate
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.execution import execute_long_with_oco, list_activities_fills, get_positions
 
+# --- Alpaca creds from env (expected by data.py) ---
+ALPACA_BASE_URL = os.getenv("APCA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_KEY = os.getenv("ALPACA_KEY") or os.getenv("APCA_API_KEY_ID") or ""
+ALPACA_SECRET = os.getenv("ALPACA_SECRET") or os.getenv("APCA_API_SECRET_KEY") or ""
+
 # -------------------------
 # Globals (kept minimal)
 # -------------------------
@@ -36,13 +41,15 @@ def _log_path(cfg_path: str) -> str:
 def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger):
     try:
         # 1) bars & indicators
-        bars = get_alpaca_bars(sym, timeframe=cfg["timeframe"], days=int(cfg.get("history_days", 30)))
+        bars = get_alpaca_bars(ALPACA_KEY, ALPACA_SECRET, cfg["timeframe"], sym,
+                               days=int(cfg.get("history_days", 30)))
         if bars is None or len(bars) == 0:
             logger.error(symbol=sym, stage="DATA", error_code="NO_BARS")
             return
         bars = filter_rth(drop_unclosed_last_bar(bars))
         if bars is None or len(bars) < 50:
-            logger.error(symbol=sym, stage="DATA", error_code="TOO_FEW_BARS", detail=len(bars) if bars is not None else 0)
+            logger.error(symbol=sym, stage="DATA", error_code="TOO_FEW_BARS",
+                         detail=len(bars) if bars is not None else 0)
             return
 
         df = compute_indicators(bars, cfg).copy()
@@ -60,8 +67,6 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
 
         ok = long_ok(pd.Series(row), cfg)
         if not ok:
-            # Also include verbose reason in a separate line (so it’s parseable)
-            # (We call explain_long_gate for human-readable flags)
             gate_ok, reasons = explain_long_gate(pd.Series(row), cfg)
             logger.gate(symbol=sym, session=args.session, cid=cid, decision="BLOCK", reasons=reasons)
             return
@@ -70,7 +75,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
             logger.gate(symbol=sym, session=args.session, cid=cid, decision="PASS", reasons=["cross=0"])
             return
 
-        # 3) compute intended TP/SL (kept your config convention; adjust if your code computes elsewhere)
+        # 3) compute intended TP/SL (kept exactly as before)
         bcfg = cfg.get("brackets", {})
         take_profit_at = float(bcfg.get("tp_abs") or 0.0)
         stop_loss_at   = float(bcfg.get("sl_abs") or 0.0)
@@ -80,6 +85,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
         sl = round2(px - stop_loss_at)   if stop_loss_at > 0 else round2(px * (1 - float(bcfg.get("sl_pct", 0))/100.0))
 
         qty = int(cfg.get("qty", 1))
+
         # 4) EXECUTION (safe sequencing; lifecycle-logged)
         res = execute_long_with_oco(
             logger=logger,
@@ -95,6 +101,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
 
         if res.get("status") != "ok":
             # backoff this symbol for a short period to avoid spamming rejects
+            from EMAMerged.src.utils import new_york_now  # local import to avoid top-coupling
             _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
             return
 
@@ -111,11 +118,11 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
                                     "avg_price": float(p.get("avg_entry_price", 0.0)),
                                 }])
         except Exception as e:
-            logger.error(symbol=sym, session=args.session, cid=cid, stage="SNAPSHOT", error_code="POS_ERR", error_text=str(e))
+            logger.error(symbol=sym, session=args.session, cid=cid, stage="SNAPSHOT",
+                         error_code="POS_ERR", error_text=str(e))
 
     except Exception as e:
         logger.error(symbol=sym, session=args.session, stage="MANAGE", error_text=str(e))
-        # cooldown this symbol to avoid tight loops on errors
         _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
 
 def main():
@@ -126,7 +133,9 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    if not alpaca_market_open():
+
+    # Use current data.py signature
+    if not alpaca_market_open(ALPACA_BASE_URL, ALPACA_KEY, ALPACA_SECRET):
         # Keep old behavior but emit heartbeat for observability
         logger = TradeLogger(_log_path(args.config))
         logger.heartbeat(session=args.session, market_open=False)
