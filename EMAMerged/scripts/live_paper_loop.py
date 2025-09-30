@@ -130,6 +130,11 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--tickers", type=str, default=None)
     parser.add_argument("--session", type=str, default="AM")
+
+    # Accept but ignore these so market_loop can pass them without breaking
+    parser.add_argument("--dry-run", type=int, default=0)
+    parser.add_argument("--force-run", type=int, default=0)
+
     args = parser.parse_args()
 
     cfg = load_config(args.config)
