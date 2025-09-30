@@ -11,7 +11,7 @@ from EMAMerged.src.data import (
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok, explain_long_gate
 
-# NEW: lifecycle logger & execution sequencing
+# lifecycle logger & execution sequencing
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.execution import execute_long_with_oco, list_activities_fills, get_positions
 
@@ -40,9 +40,15 @@ def _log_path(cfg_path: str) -> str:
 
 def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger):
     try:
-        # 1) bars & indicators
-        bars = get_alpaca_bars(ALPACA_KEY, ALPACA_SECRET, cfg["timeframe"], sym,
-                               days=int(cfg.get("history_days", 30)))
+        # 1) bars & indicators — make network robust
+        try:
+            bars = get_alpaca_bars(ALPACA_KEY, ALPACA_SECRET, cfg["timeframe"], sym,
+                                   days=int(cfg.get("history_days", 30)))
+        except Exception as e:
+            logger.error(symbol=sym, session=args.session, stage="DATA",
+                         error_code="BARS_FETCH", error_text=str(e))
+            return
+
         if bars is None or len(bars) == 0:
             logger.error(symbol=sym, stage="DATA", error_code="NO_BARS")
             return
@@ -138,16 +144,22 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    logger = TradeLogger(_log_path(args.config))
 
-    # Use current data.py signature
-    if not alpaca_market_open(ALPACA_BASE_URL, ALPACA_KEY, ALPACA_SECRET):
-        # Keep old behavior but emit heartbeat for observability
-        logger = TradeLogger(_log_path(args.config))
+    # Robust market-open check (don’t crash on bad/empty JSON)
+    is_open = True
+    try:
+        is_open = alpaca_market_open(ALPACA_BASE_URL, ALPACA_KEY, ALPACA_SECRET)
+    except Exception as e:
+        logger.error(stage="MARKET_OPEN_CHECK", error_code="JSON_DECODE", error_text=str(e))
+        # degrade gracefully: proceed as open to avoid blocking the loop
+        is_open = True
+
+    if not is_open:
         logger.heartbeat(session=args.session, market_open=False)
         return
 
     # Initialize logger per run; one JSONL per UTC day
-    logger = TradeLogger(_log_path(args.config))
     logger.heartbeat(session=args.session, market_open=True)
 
     # Determine symbols
