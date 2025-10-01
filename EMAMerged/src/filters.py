@@ -103,7 +103,7 @@ def _ensure_rsi(df: pd.DataFrame, rsi_col: str = "rsi", period: int = 14) -> pd.
     loss = (-delta.clip(upper=0)).rolling(period).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    df[rsi_col] = rsi.fillna(method="bfill").fillna(50.0)
+    df[rsi_col] = rsi.bfill().fillna(50.0)
     return df
 
 
