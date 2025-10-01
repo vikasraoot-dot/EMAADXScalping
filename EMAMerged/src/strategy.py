@@ -8,15 +8,13 @@ def compute_indicators(df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
     out = df.copy()
     f = int(cfg.get("ema_fast", 9))
     s = int(cfg.get("ema_slow", 21))
-    ap = int(cfg.get("atr_period", 14))
+    ap = int(cfg.get("atr_period", cfg.get("atr_length", 14)))
 
     out["ema_fast"] = ema(out["close"], f)
     out["ema_slow"] = ema(out["close"], s)
     out["atr"] = _atr(out, period=ap)
-    # rsi also attached in filters (but keep here for redundancy)
-    rsi_p = int(cfg.get("filters", {}).get("rsi_period", cfg.get("rsi_period", 14)))
-    out["rsi"] = _rsi(out["close"], rsi_p)
 
+    # If you ever want RSI directly here, you can add it; attach_verifiers provides it now.
     return attach_verifiers(out, cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow")
 
 def crossover(df: pd.DataFrame) -> int:
