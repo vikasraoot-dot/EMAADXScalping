@@ -36,7 +36,7 @@ run:
 # ──────────────────────────────────────────────────────────────────────────────
 ema_fast: 9
 ema_slow: 21
-rsi_length: 14        # mapped to filters.rsi_period
+rsi_length: 16        # mapped to filters.rsi_period
 atr_length: 14        # mapped to atr_period for ATR calc
 vol_sma_length: 10
 
@@ -73,7 +73,7 @@ breakeven:
 # ──────────────────────────────────────────────────────────────────────────────
 filters:
   adx_threshold: 22.0        # trend strength gate (raise to 25.0 for stricter)
-  rsi_period: 14             # comes from rsi_length above if omitted
+  rsi_period: 16             # comes from rsi_length above if omitted
   rsi_min: 52                # reference rsi_long_min
   rsi_max: 66                # reference rsi_long_max
   slope_threshold_pct: 0.0008  # require EMA_fast slope ≥ +0.08% per bar
