@@ -13,7 +13,11 @@ from EMAMerged.src.filters import long_ok, explain_long_gate
 
 # lifecycle logger & execution sequencing
 from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.execution import execute_long_with_oco, get_positions
+from EMAMerged.src.execution import (
+    execute_long_with_oco,
+    get_positions,
+    configure_alpaca,
+)
 
 ET = pytz.timezone("US/Eastern")
 _ERROR_COOLDOWN: dict[str, datetime] = {}
@@ -62,13 +66,13 @@ def _require_creds_or_bail(logger: TradeLogger, base_url: str, key: str, secret:
         logger.error(
             stage="CREDENTIALS",
             error_code="MISSING",
-            error_text="Alpaca creds missing: set APCA_BASE_URL + (APCA_API_KEY_ID|ALPACA_KEY) + (APCA_API_SECRET_KEY|ALPACA_SECRET), or add broker.base_url/key/secret in config."
+            error_text="Alpaca creds missing: set APCA_BASE_URL + (APCA_API_KEY_ID|ALPACA_KEY) + (APCA_API_SECRET_KEY|ALPACA_SECRET) or set broker.{base_url,key,secret} in config."
         )
     return ok
 
 def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger, key: str, secret: str):
     try:
-        # 1) bars & indicators — network-robust try/except
+        # 1) Pull bars (historic fetch works after-hours)
         try:
             bars = get_alpaca_bars(key, secret, cfg["timeframe"], sym,
                                    days=int(cfg.get("history_days", 30)))
@@ -80,17 +84,21 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
         if bars is None or len(bars) == 0:
             logger.error(symbol=sym, stage="DATA", error_code="NO_BARS")
             return
-        bars = filter_rth(drop_unclosed_last_bar(bars))
+
+        # IMPORTANT: pass timeframe to drop_unclosed_last_bar
+        bars = drop_unclosed_last_bar(bars, cfg["timeframe"])
+        bars = filter_rth(bars)
         if bars is None or len(bars) < 50:
             logger.error(symbol=sym, stage="DATA", error_code="TOO_FEW_BARS",
                          detail=len(bars) if bars is not None else 0)
             return
 
+        # 2) Indicators + scanner
         df = compute_indicators(bars, cfg).copy()
-        cross = crossover(df, cfg)  # typically last-bar cross
+        cross = crossover(df, cfg)
         row = df.iloc[-1].to_dict()
 
-        # 2) scanner + gate telemetry
+        # 3) Scanner + gate telemetry
         cid = _cid(sym)
         logger.signal(symbol=sym, session=args.session, cid=cid, tf=cfg["timeframe"],
                       cross=int(cross), ref_bar_ts=str(df.index[-1]),
@@ -109,7 +117,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
             logger.gate(symbol=sym, session=args.session, cid=cid, decision="PASS", reasons=["cross=0"])
             return
 
-        # 3) compute intended TP/SL (kept exactly as before)
+        # 4) Brackets (unchanged logic)
         bcfg = cfg.get("brackets", {})
         take_profit_at = float(bcfg.get("tp_abs") or 0.0)
         stop_loss_at   = float(bcfg.get("sl_abs") or 0.0)
@@ -120,7 +128,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
 
         qty = int(cfg.get("qty", 1))
 
-        # 4) EXECUTION (safe sequencing; lifecycle-logged)
+        # 5) Execution (uses execution.configure_alpaca creds set in main())
         res = execute_long_with_oco(
             logger=logger,
             symbol=sym,
@@ -134,10 +142,11 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
         )
 
         if res.get("status") != "ok":
+            # Cooldown to avoid thrashing on the same symbol
             _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
             return
 
-        # 5) optional: include a lightweight snapshot of positions after entry
+        # 6) Optional snapshot
         try:
             pos = get_positions(sym)
             if pos:
@@ -161,27 +170,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--tickers", type=str, default=None)
+    parser.add_argument("--symbols", type=str, default=None)  # NEW: accept comma-separated symbols
     parser.add_argument("--session", type=str, default="AM")
-    # accept but ignore these so market_loop can pass them without breaking
-    parser.add_argument("--dry-run", type=int, default=0)
-    parser.add_argument("--force-run", type=int, default=0)
+    parser.add_argument("--dry-run", type=int, default=0)     # accepted for compatibility
+    parser.add_argument("--force-run", type=int, default=0)   # use 1 to bypass open check after-hours
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     logger = TradeLogger(_log_path(args.config))
 
-    # Resolve creds from env or config; bail early with clear message if missing
+    # Resolve creds from env or config
     base_url, key, secret = _resolve_alpaca(cfg)
     if not _require_creds_or_bail(logger, base_url, key, secret):
         print("[live] MISSING Alpaca credentials. Set env or add broker section in config; see README.")
         sys.exit(2)
 
-    # Market-open check (robust; non-JSON won’t crash the loop)
-    try:
-        is_open = alpaca_market_open(base_url, key, secret)
-    except Exception as e:
-        logger.error(stage="MARKET_OPEN_CHECK", error_code="HTTP_JSON", error_text=str(e))
-        is_open = True  # degrade gracefully, don’t block loop
+    # Ensure execution.py uses the same creds (it defaults to env)
+    configure_alpaca(base_url, key, secret)
+
+    # Market-open check (skip if --force-run 1 for after-hours testing)
+    if args.force_run and int(args.force_run) > 0:
+        logger.heartbeat(session=args.session, market_open="FORCED_TRUE")
+        is_open = True
+    else:
+        try:
+            is_open = alpaca_market_open(base_url, key, secret)
+        except Exception as e:
+            logger.error(stage="MARKET_OPEN_CHECK", error_code="HTTP_JSON", error_text=str(e))
+            is_open = True  # degrade gracefully
 
     if not is_open:
         logger.heartbeat(session=args.session, market_open=False)
@@ -190,7 +206,12 @@ def main():
     logger.heartbeat(session=args.session, market_open=True)
 
     # Determine symbols
-    if args.tickers:
+    symbols: list[str] = []
+    if args.symbols:
+        # split comma/space; uppercase & dedupe
+        parts = [s.strip().upper() for s in args.symbols.replace(",", " ").split() if s.strip()]
+        symbols = list(dict.fromkeys(parts))
+    elif args.tickers:
         symbols = read_tickers(args.tickers)
     else:
         symbols = cfg.get("symbols", [])
@@ -201,12 +222,10 @@ def main():
         try:
             until = _ERROR_COOLDOWN.get(sym)
             if until and new_york_now() < until:
-                print(f"[{sym}] cooldown until {until.strftime('%H:%M')} (skip)")
                 logger.heartbeat(symbol=sym, cooldown_until=until.astimezone(ET).strftime("%H:%M"))
                 continue
             manage_symbol(sym, cfg, args, logger, key=key, secret=secret)
         except Exception as e:
-            print(f"[{sym}] fatal: {e}")
             logger.error(symbol=sym, session=args.session, stage="LOOP", error_text=str(e))
 
 if __name__ == "__main__":
