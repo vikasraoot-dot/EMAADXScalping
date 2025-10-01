@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os, sys, argparse
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 import pytz
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
@@ -11,13 +11,42 @@ from EMAMerged.src.data import (
 )
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok, explain_long_gate
+from EMAMerged.src.config_compat import normalize_config
 
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.execution import execute_long_with_oco, get_positions
-from EMAMerged.src.execution_creds import configure_alpaca  # <- shim
+from EMAMerged.src.execution_creds import configure_alpaca
 
-ET = pytz.timezone("US/Eastern")
-_ERROR_COOLDOWN: dict[str, datetime] = {}
+def _tz(cfg) -> pytz.BaseTzInfo:
+    try:
+        return pytz.timezone(cfg.get("timezone", "US/Eastern"))
+    except Exception:
+        return pytz.timezone("US/Eastern")
+
+def _now_tz(cfg) -> datetime:
+    return datetime.now(_tz(cfg))
+
+def _within_entry_windows(cfg) -> bool:
+    """
+    If config provides entry_windows: [{start:'HH:MM', end:'HH:MM'}, ...] in cfg.timezone,
+    only allow entries during those windows. If not present, always True.
+    """
+    wins = cfg.get("entry_windows")
+    if not isinstance(wins, list) or not wins:
+        return True
+    now_local = _now_tz(cfg).time()
+    for w in wins:
+        try:
+            s = w.get("start", "00:00")
+            e = w.get("end", "23:59")
+            t0 = dtime.fromisoformat(s)
+            t1 = dtime.fromisoformat(e)
+            if t0 <= now_local <= t1:
+                return True
+        except Exception:
+            # ignore malformed window
+            continue
+    return False
 
 def _cid(sym: str) -> str:
     now = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -70,37 +99,48 @@ def _compute_brackets_from_cfg(px: float, row: dict, bcfg: dict) -> tuple[float,
       TP = px + take_profit_r * R
     Fallback to abs/percent keys if ATR/R not configured.
     """
-    # ATR/R path
     atr_mult_sl = bcfg.get("atr_mult_sl")
     take_profit_r = bcfg.get("take_profit_r")
-    atr = row.get("atr") or row.get("ATR")  # indicator field name
+    atr = row.get("atr") or row.get("ATR")
     if atr_mult_sl is not None and take_profit_r is not None and atr:
         try:
-            atr_mult_sl = float(atr_mult_sl)
-            take_profit_r = float(take_profit_r)
-            atr = float(atr)
-            R = atr_mult_sl * atr
+            R = float(atr_mult_sl) * float(atr)
             sl = round2(px - 1.0 * R)
-            tp = round2(px + take_profit_r * R)
+            tp = round2(px + float(take_profit_r) * R)
             return tp, sl
         except Exception:
-            pass  # fallback below if anything is off
+            pass
 
-    # Legacy abs/percent path
     tp_abs = bcfg.get("tp_abs")
     sl_abs = bcfg.get("sl_abs")
     tp_pct = bcfg.get("tp_pct")
     sl_pct = bcfg.get("sl_pct")
-
     if tp_abs is not None or sl_abs is not None:
         tp = round2(px + float(tp_abs or 0.0))
         sl = round2(px - float(sl_abs or 0.0))
         return tp, sl
-
-    # percent fallback
     tp = round2(px * (1 + float(tp_pct or 0.0)/100.0))
     sl = round2(px * (1 - float(sl_pct or 0.0)/100.0))
     return tp, sl
+
+def _cap_qty_by_limits(cfg: dict, px: float, base_qty: int) -> int:
+    # max_shares_per_trade (reference)
+    eff = int(base_qty)
+    mshares = cfg.get("max_shares_per_trade")
+    if mshares is not None:
+        try:
+            eff = min(eff, int(mshares))
+        except Exception:
+            pass
+    # max_notional_per_trade (already in your cfg)
+    cap = cfg.get("max_notional_per_trade")
+    if cap is not None:
+        try:
+            cap = float(cap)
+            eff = max(0, min(eff, int(cap // max(px, 1e-9))))
+        except Exception:
+            pass
+    return eff
 
 def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger, key: str, secret: str):
     try:
@@ -118,7 +158,8 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
             return
 
         bars = drop_unclosed_last_bar(bars, cfg["timeframe"])
-        bars = filter_rth(bars)
+        if cfg.get("rth_only", True):
+            bars = filter_rth(bars)
         if bars is None or len(bars) < 50:
             logger.error(symbol=sym, stage="DATA", error_code="TOO_FEW_BARS",
                          detail=len(bars) if bars is not None else 0)
@@ -126,7 +167,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
 
         # INDICATORS + SCANNER
         df = compute_indicators(bars, cfg).copy()
-        cross = crossover(df, cfg)
+        cross = crossover(df)
         row = df.iloc[-1].to_dict()
 
         # SIGNAL + GATE LOGGING
@@ -148,11 +189,38 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
             logger.gate(symbol=sym, session=args.session, cid=cid, decision="PASS", reasons=["cross=0"])
             return
 
+        # Enforce max open trades per ticker (reference knob)
+        max_open = int(cfg.get("max_open_trades_per_ticker", 1))
+        try:
+            pos = get_positions(sym) or []
+            open_qty = 0.0
+            if pos:
+                # alpaca-like position object; sum qty if multiple (defensive)
+                for p in pos:
+                    try:
+                        open_qty += float(p.get("qty", 0))
+                    except Exception:
+                        pass
+            if max_open <= 0 or open_qty > 0 and max_open <= 1:
+                logger.gate(symbol=sym, session=args.session, cid=cid,
+                            decision="BLOCK", reasons=[f"max_open_trades_per_ticker={max_open}"])
+                return
+        except Exception:
+            # on error, don't block; we log later if execute fails
+            pass
+
         # BRACKETS
         bcfg = cfg.get("brackets", {}) or {}
         px = float(row["close"])
         tp, sl = _compute_brackets_from_cfg(px, row, bcfg)
-        qty = int(cfg.get("qty", 1))
+
+        # QTY with safety caps
+        base_qty = int(cfg.get("qty", 1))
+        qty = _cap_qty_by_limits(cfg, px, base_qty)
+        if qty <= 0:
+            logger.gate(symbol=sym, session=args.session, cid=cid,
+                        decision="BLOCK", reasons=["qty=0 after caps"])
+            return
 
         # EXECUTE
         res = execute_long_with_oco(
@@ -168,7 +236,6 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
         )
 
         if res.get("status") != "ok":
-            _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
             return
 
         # SNAPSHOT (optional)
@@ -183,13 +250,11 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
                                     "qty": float(p.get("qty", 0)),
                                     "avg_price": float(p.get("avg_entry_price", 0.0)),
                                 }])
-        except Exception as e:
-            logger.error(symbol=sym, session=args.session, cid=cid, stage="SNAPSHOT",
-                         error_code="POS_ERR", error_text=str(e))
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error(symbol=sym, session=args.session, stage="MANAGE", error_text=str(e))
-        _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -201,7 +266,9 @@ def main():
     parser.add_argument("--force-run", type=int, default=0)
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    raw_cfg = load_config(args.config)
+    cfg = normalize_config(raw_cfg)  # <- make reference-style config work
+
     logger = TradeLogger(_log_path(args.config))
 
     # CREDS
@@ -209,8 +276,6 @@ def main():
     if not _require_creds_or_bail(logger, base_url, key, secret):
         print("[live] MISSING Alpaca credentials. Set env or add broker section in config.")
         sys.exit(2)
-
-    # Make execution layer see creds via env (no change to stable code)
     configure_alpaca(base_url, key, secret)
 
     # OPEN CHECK (skip only if --force-run 1)
@@ -230,6 +295,12 @@ def main():
 
     logger.heartbeat(session=args.session, market_open=True)
 
+    # Entry windows (if provided)
+    if not _within_entry_windows(cfg):
+        logger.gate(session=args.session, symbol=None, cid=None,
+                    decision="BLOCK", reasons=["outside entry_windows"])
+        return
+
     # SYMBOLS
     symbols: list[str] = []
     if args.symbols:
@@ -244,10 +315,6 @@ def main():
 
     for sym in symbols:
         try:
-            until = _ERROR_COOLDOWN.get(sym)
-            if until and new_york_now() < until:
-                logger.heartbeat(symbol=sym, cooldown_until=until.astimezone(ET).strftime("%H:%M"))
-                continue
             manage_symbol(sym, cfg, args, logger, key=key, secret=secret)
         except Exception as e:
             logger.error(symbol=sym, session=args.session, stage="LOOP", error_text=str(e))
