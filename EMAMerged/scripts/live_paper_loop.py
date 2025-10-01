@@ -12,12 +12,9 @@ from EMAMerged.src.data import (
 from EMAMerged.src.strategy import compute_indicators, crossover
 from EMAMerged.src.filters import long_ok, explain_long_gate
 
-# lifecycle logger & execution sequencing
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.execution import execute_long_with_oco, get_positions
-
-# NEW: bring in the shim that sets env vars for execution.py
-from EMAMerged.src.execution_creds import configure_alpaca
+from EMAMerged.src.execution_creds import configure_alpaca  # <- shim
 
 ET = pytz.timezone("US/Eastern")
 _ERROR_COOLDOWN: dict[str, datetime] = {}
@@ -34,12 +31,6 @@ def _log_path(cfg_path: str) -> str:
     return os.path.join(logs_dir, f"trades_{dstr}.jsonl")
 
 def _resolve_alpaca(cfg: dict) -> tuple[str,str,str]:
-    """
-    Resolve Alpaca creds in this order:
-      1) Env: APCA_BASE_URL / APCA_API_KEY_ID / APCA_API_SECRET_KEY
-              (or ALPACA_KEY / ALPACA_SECRET as alternates)
-      2) Config: cfg['broker'] = {base_url,key,secret}
-    """
     b = (cfg or {}).get("broker", {}) or {}
     base_url = (
         os.getenv("APCA_BASE_URL")
@@ -71,9 +62,49 @@ def _require_creds_or_bail(logger: TradeLogger, base_url: str, key: str, secret:
         )
     return ok
 
+def _compute_brackets_from_cfg(px: float, row: dict, bcfg: dict) -> tuple[float,float]:
+    """
+    Prefer ATR/R style if present:
+      R = atr_mult_sl * ATR
+      SL = px - 1.0 * R
+      TP = px + take_profit_r * R
+    Fallback to abs/percent keys if ATR/R not configured.
+    """
+    # ATR/R path
+    atr_mult_sl = bcfg.get("atr_mult_sl")
+    take_profit_r = bcfg.get("take_profit_r")
+    atr = row.get("atr") or row.get("ATR")  # indicator field name
+    if atr_mult_sl is not None and take_profit_r is not None and atr:
+        try:
+            atr_mult_sl = float(atr_mult_sl)
+            take_profit_r = float(take_profit_r)
+            atr = float(atr)
+            R = atr_mult_sl * atr
+            sl = round2(px - 1.0 * R)
+            tp = round2(px + take_profit_r * R)
+            return tp, sl
+        except Exception:
+            pass  # fallback below if anything is off
+
+    # Legacy abs/percent path
+    tp_abs = bcfg.get("tp_abs")
+    sl_abs = bcfg.get("sl_abs")
+    tp_pct = bcfg.get("tp_pct")
+    sl_pct = bcfg.get("sl_pct")
+
+    if tp_abs is not None or sl_abs is not None:
+        tp = round2(px + float(tp_abs or 0.0))
+        sl = round2(px - float(sl_abs or 0.0))
+        return tp, sl
+
+    # percent fallback
+    tp = round2(px * (1 + float(tp_pct or 0.0)/100.0))
+    sl = round2(px * (1 - float(sl_pct or 0.0)/100.0))
+    return tp, sl
+
 def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger, key: str, secret: str):
     try:
-        # 1) Pull bars (historical fetch works premarket/after hours as well)
+        # DATA
         try:
             bars = get_alpaca_bars(key, secret, cfg["timeframe"], sym,
                                    days=int(cfg.get("history_days", 30)))
@@ -86,7 +117,6 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
             logger.error(symbol=sym, stage="DATA", error_code="NO_BARS")
             return
 
-        # IMPORTANT: pass timeframe to drop_unclosed_last_bar
         bars = drop_unclosed_last_bar(bars, cfg["timeframe"])
         bars = filter_rth(bars)
         if bars is None or len(bars) < 50:
@@ -94,12 +124,12 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
                          detail=len(bars) if bars is not None else 0)
             return
 
-        # 2) Indicators + scanner
+        # INDICATORS + SCANNER
         df = compute_indicators(bars, cfg).copy()
         cross = crossover(df, cfg)
         row = df.iloc[-1].to_dict()
 
-        # 3) Scanner + gate telemetry
+        # SIGNAL + GATE LOGGING
         cid = _cid(sym)
         logger.signal(symbol=sym, session=args.session, cid=cid, tf=cfg["timeframe"],
                       cross=int(cross), ref_bar_ts=str(df.index[-1]),
@@ -118,18 +148,13 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
             logger.gate(symbol=sym, session=args.session, cid=cid, decision="PASS", reasons=["cross=0"])
             return
 
-        # 4) Brackets (unchanged logic)
-        bcfg = cfg.get("brackets", {})
-        take_profit_at = float(bcfg.get("tp_abs") or 0.0)
-        stop_loss_at   = float(bcfg.get("sl_abs") or 0.0)
-
+        # BRACKETS
+        bcfg = cfg.get("brackets", {}) or {}
         px = float(row["close"])
-        tp = round2(px + take_profit_at) if take_profit_at > 0 else round2(px * (1 + float(bcfg.get("tp_pct", 0))/100.0))
-        sl = round2(px - stop_loss_at)   if stop_loss_at > 0 else round2(px * (1 - float(bcfg.get("sl_pct", 0))/100.0))
-
+        tp, sl = _compute_brackets_from_cfg(px, row, bcfg)
         qty = int(cfg.get("qty", 1))
 
-        # 5) Execution (uses env set by configure_alpaca in main())
+        # EXECUTE
         res = execute_long_with_oco(
             logger=logger,
             symbol=sym,
@@ -143,11 +168,10 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
         )
 
         if res.get("status") != "ok":
-            # Cooldown to avoid thrashing on the same symbol
             _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
             return
 
-        # 6) Optional snapshot
+        # SNAPSHOT (optional)
         try:
             pos = get_positions(sym)
             if pos:
@@ -171,25 +195,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--tickers", type=str, default=None)
-    parser.add_argument("--symbols", type=str, default=None)  # accept comma-separated symbols
+    parser.add_argument("--symbols", type=str, default=None)  # comma-separated
     parser.add_argument("--session", type=str, default="AM")
-    parser.add_argument("--dry-run", type=int, default=0)     # accepted for compatibility
-    parser.add_argument("--force-run", type=int, default=0)   # when 1, bypasses market-open
+    parser.add_argument("--dry-run", type=int, default=0)
+    parser.add_argument("--force-run", type=int, default=0)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     logger = TradeLogger(_log_path(args.config))
 
-    # Resolve creds from env or config; bail early with clear message if missing
+    # CREDS
     base_url, key, secret = _resolve_alpaca(cfg)
     if not _require_creds_or_bail(logger, base_url, key, secret):
         print("[live] MISSING Alpaca credentials. Set env or add broker section in config.")
         sys.exit(2)
 
-    # NEW: ensure execution layer sees credentials (via env) with zero churn
+    # Make execution layer see creds via env (no change to stable code)
     configure_alpaca(base_url, key, secret)
 
-    # Market-open check (skip only if --force-run 1)
+    # OPEN CHECK (skip only if --force-run 1)
     if args.force_run and int(args.force_run) > 0:
         logger.heartbeat(session=args.session, market_open="FORCED_TRUE")
         is_open = True
@@ -198,7 +222,7 @@ def main():
             is_open = alpaca_market_open(base_url, key, secret)
         except Exception as e:
             logger.error(stage="MARKET_OPEN_CHECK", error_code="HTTP_JSON", error_text=str(e))
-            is_open = True  # degrade gracefully but don’t block loop
+            is_open = True  # degrade gracefully
 
     if not is_open:
         logger.heartbeat(session=args.session, market_open=False)
@@ -206,10 +230,9 @@ def main():
 
     logger.heartbeat(session=args.session, market_open=True)
 
-    # Determine symbols
+    # SYMBOLS
     symbols: list[str] = []
     if args.symbols:
-        # split comma/space; uppercase & dedupe
         parts = [s.strip().upper() for s in args.symbols.replace(",", " ").split() if s.strip()]
         symbols = list(dict.fromkeys(parts))
     elif args.tickers:
