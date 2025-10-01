@@ -1,3 +1,4 @@
+# EMAMerged/scripts/live_paper_loop.py
 from __future__ import annotations
 import os, sys, argparse
 import pandas as pd
@@ -13,11 +14,10 @@ from EMAMerged.src.filters import long_ok, explain_long_gate
 
 # lifecycle logger & execution sequencing
 from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.execution import (
-    execute_long_with_oco,
-    get_positions,
-    configure_alpaca,
-)
+from EMAMerged.src.execution import execute_long_with_oco, get_positions
+
+# NEW: bring in the shim that sets env vars for execution.py
+from EMAMerged.src.execution_creds import configure_alpaca
 
 ET = pytz.timezone("US/Eastern")
 _ERROR_COOLDOWN: dict[str, datetime] = {}
@@ -66,13 +66,14 @@ def _require_creds_or_bail(logger: TradeLogger, base_url: str, key: str, secret:
         logger.error(
             stage="CREDENTIALS",
             error_code="MISSING",
-            error_text="Alpaca creds missing: set APCA_BASE_URL + (APCA_API_KEY_ID|ALPACA_KEY) + (APCA_API_SECRET_KEY|ALPACA_SECRET) or set broker.{base_url,key,secret} in config."
+            error_text=("Alpaca creds missing: set APCA_BASE_URL + (APCA_API_KEY_ID|ALPACA_KEY) "
+                        "+ (APCA_API_SECRET_KEY|ALPACA_SECRET) or set broker.{base_url,key,secret} in config.")
         )
     return ok
 
 def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger, key: str, secret: str):
     try:
-        # 1) Pull bars (historic fetch works after-hours)
+        # 1) Pull bars (historical fetch works premarket/after hours as well)
         try:
             bars = get_alpaca_bars(key, secret, cfg["timeframe"], sym,
                                    days=int(cfg.get("history_days", 30)))
@@ -128,7 +129,7 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
 
         qty = int(cfg.get("qty", 1))
 
-        # 5) Execution (uses execution.configure_alpaca creds set in main())
+        # 5) Execution (uses env set by configure_alpaca in main())
         res = execute_long_with_oco(
             logger=logger,
             symbol=sym,
@@ -170,25 +171,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--tickers", type=str, default=None)
-    parser.add_argument("--symbols", type=str, default=None)  # NEW: accept comma-separated symbols
+    parser.add_argument("--symbols", type=str, default=None)  # accept comma-separated symbols
     parser.add_argument("--session", type=str, default="AM")
     parser.add_argument("--dry-run", type=int, default=0)     # accepted for compatibility
-    parser.add_argument("--force-run", type=int, default=0)   # use 1 to bypass open check after-hours
+    parser.add_argument("--force-run", type=int, default=0)   # when 1, bypasses market-open
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     logger = TradeLogger(_log_path(args.config))
 
-    # Resolve creds from env or config
+    # Resolve creds from env or config; bail early with clear message if missing
     base_url, key, secret = _resolve_alpaca(cfg)
     if not _require_creds_or_bail(logger, base_url, key, secret):
-        print("[live] MISSING Alpaca credentials. Set env or add broker section in config; see README.")
+        print("[live] MISSING Alpaca credentials. Set env or add broker section in config.")
         sys.exit(2)
 
-    # Ensure execution.py uses the same creds (it defaults to env)
+    # NEW: ensure execution layer sees credentials (via env) with zero churn
     configure_alpaca(base_url, key, secret)
 
-    # Market-open check (skip if --force-run 1 for after-hours testing)
+    # Market-open check (skip only if --force-run 1)
     if args.force_run and int(args.force_run) > 0:
         logger.heartbeat(session=args.session, market_open="FORCED_TRUE")
         is_open = True
@@ -197,7 +198,7 @@ def main():
             is_open = alpaca_market_open(base_url, key, secret)
         except Exception as e:
             logger.error(stage="MARKET_OPEN_CHECK", error_code="HTTP_JSON", error_text=str(e))
-            is_open = True  # degrade gracefully
+            is_open = True  # degrade gracefully but don’t block loop
 
     if not is_open:
         logger.heartbeat(session=args.session, market_open=False)
