@@ -1,7 +1,7 @@
 from __future__ import annotations
-import os, sys, argparse, math
+import os, sys, argparse
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
@@ -13,36 +13,64 @@ from EMAMerged.src.filters import long_ok, explain_long_gate
 
 # lifecycle logger & execution sequencing
 from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.execution import execute_long_with_oco, list_activities_fills, get_positions
+from EMAMerged.src.execution import execute_long_with_oco, get_positions
 
-# --- Alpaca creds from env (expected by data.py) ---
-ALPACA_BASE_URL = os.getenv("APCA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_KEY = os.getenv("ALPACA_KEY") or os.getenv("APCA_API_KEY_ID") or ""
-ALPACA_SECRET = os.getenv("ALPACA_SECRET") or os.getenv("APCA_API_SECRET_KEY") or ""
-
-# -------------------------
-# Globals (kept minimal)
-# -------------------------
-_ERROR_COOLDOWN: dict[str, datetime] = {}
 ET = pytz.timezone("US/Eastern")
+_ERROR_COOLDOWN: dict[str, datetime] = {}
 
 def _cid(sym: str) -> str:
-    # deterministically includes date+minute to help correlate loops
-    now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    now = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"EMA_{sym}_{now}"
 
 def _log_path(cfg_path: str) -> str:
     root = os.path.dirname(os.path.abspath(cfg_path))
-    dstr = datetime.utcnow().strftime("%Y%m%d")
+    dstr = datetime.now(timezone.utc).strftime("%Y%m%d")
     logs_dir = os.path.join(root, "logs")
     os.makedirs(logs_dir, exist_ok=True)
     return os.path.join(logs_dir, f"trades_{dstr}.jsonl")
 
-def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger):
+def _resolve_alpaca(cfg: dict) -> tuple[str,str,str]:
+    """
+    Resolve Alpaca creds in this order:
+      1) Env: APCA_BASE_URL / APCA_API_KEY_ID / APCA_API_SECRET_KEY
+              (or ALPACA_KEY / ALPACA_SECRET as alternates)
+      2) Config: cfg['broker'] = {base_url,key,secret}
+    """
+    b = (cfg or {}).get("broker", {}) or {}
+    base_url = (
+        os.getenv("APCA_BASE_URL")
+        or b.get("base_url")
+        or "https://paper-api.alpaca.markets"
+    )
+    key = (
+        os.getenv("ALPACA_KEY")
+        or os.getenv("APCA_API_KEY_ID")
+        or b.get("key")
+        or ""
+    )
+    secret = (
+        os.getenv("ALPACA_SECRET")
+        or os.getenv("APCA_API_SECRET_KEY")
+        or b.get("secret")
+        or ""
+    )
+    return base_url, key, secret
+
+def _require_creds_or_bail(logger: TradeLogger, base_url: str, key: str, secret: str) -> bool:
+    ok = bool(base_url and key and secret)
+    if not ok:
+        logger.error(
+            stage="CREDENTIALS",
+            error_code="MISSING",
+            error_text="Alpaca creds missing: set APCA_BASE_URL + (APCA_API_KEY_ID|ALPACA_KEY) + (APCA_API_SECRET_KEY|ALPACA_SECRET), or add broker.base_url/key/secret in config."
+        )
+    return ok
+
+def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger, key: str, secret: str):
     try:
-        # 1) bars & indicators — make network robust
+        # 1) bars & indicators — network-robust try/except
         try:
-            bars = get_alpaca_bars(ALPACA_KEY, ALPACA_SECRET, cfg["timeframe"], sym,
+            bars = get_alpaca_bars(key, secret, cfg["timeframe"], sym,
                                    days=int(cfg.get("history_days", 30)))
         except Exception as e:
             logger.error(symbol=sym, session=args.session, stage="DATA",
@@ -106,8 +134,6 @@ def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLo
         )
 
         if res.get("status") != "ok":
-            # backoff this symbol for a short period to avoid spamming rejects
-            from EMAMerged.src.utils import new_york_now  # local import to avoid top-coupling
             _ERROR_COOLDOWN[sym] = new_york_now() + timedelta(minutes=3)
             return
 
@@ -136,30 +162,31 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--tickers", type=str, default=None)
     parser.add_argument("--session", type=str, default="AM")
-
-    # Accept but ignore these so market_loop can pass them without breaking
+    # accept but ignore these so market_loop can pass them without breaking
     parser.add_argument("--dry-run", type=int, default=0)
     parser.add_argument("--force-run", type=int, default=0)
-
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     logger = TradeLogger(_log_path(args.config))
 
-    # Robust market-open check (don’t crash on bad/empty JSON)
-    is_open = True
+    # Resolve creds from env or config; bail early with clear message if missing
+    base_url, key, secret = _resolve_alpaca(cfg)
+    if not _require_creds_or_bail(logger, base_url, key, secret):
+        print("[live] MISSING Alpaca credentials. Set env or add broker section in config; see README.")
+        sys.exit(2)
+
+    # Market-open check (robust; non-JSON won’t crash the loop)
     try:
-        is_open = alpaca_market_open(ALPACA_BASE_URL, ALPACA_KEY, ALPACA_SECRET)
+        is_open = alpaca_market_open(base_url, key, secret)
     except Exception as e:
-        logger.error(stage="MARKET_OPEN_CHECK", error_code="JSON_DECODE", error_text=str(e))
-        # degrade gracefully: proceed as open to avoid blocking the loop
-        is_open = True
+        logger.error(stage="MARKET_OPEN_CHECK", error_code="HTTP_JSON", error_text=str(e))
+        is_open = True  # degrade gracefully, don’t block loop
 
     if not is_open:
         logger.heartbeat(session=args.session, market_open=False)
         return
 
-    # Initialize logger per run; one JSONL per UTC day
     logger.heartbeat(session=args.session, market_open=True)
 
     # Determine symbols
@@ -170,16 +197,14 @@ def main():
         if isinstance(symbols, str) and os.path.exists(symbols):
             symbols = read_tickers(symbols)
 
-    # Per-symbol cooldown honored (existing behavior preserved)
     for sym in symbols:
         try:
             until = _ERROR_COOLDOWN.get(sym)
             if until and new_york_now() < until:
-                # keep your human-readable line AND log
-                print(f"[{sym}] on error cooldown until {until.strftime('%H:%M')} (skip)")
+                print(f"[{sym}] cooldown until {until.strftime('%H:%M')} (skip)")
                 logger.heartbeat(symbol=sym, cooldown_until=until.astimezone(ET).strftime("%H:%M"))
                 continue
-            manage_symbol(sym, cfg, args, logger)
+            manage_symbol(sym, cfg, args, logger, key=key, secret=secret)
         except Exception as e:
             print(f"[{sym}] fatal: {e}")
             logger.error(symbol=sym, session=args.session, stage="LOOP", error_text=str(e))
