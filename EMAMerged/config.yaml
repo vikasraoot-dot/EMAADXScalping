@@ -40,7 +40,7 @@ breakeven:
 
 # FILTERS (NEW: ADX threshold lives here)
 filters:
-  adx_threshold: 25.0         # <-- change this to tune the ADX gate (e.g., 22.0 or 28.0)
+  adx_threshold: 22.0         # <-- change this to tune the ADX gate (e.g., 22.0 or 28.0)
   # rsi_min: null
   # rsi_max: null
   # slope_threshold_pct: null
