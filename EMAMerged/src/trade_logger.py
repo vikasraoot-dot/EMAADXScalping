@@ -12,6 +12,9 @@ class TradeLogger:
     """
     Line-buffered JSONL logger with a compact, auditable schema.
     One event per line. Designed to be safe to call from multiple places.
+
+    Enhancement: mirror each JSONL line to stdout so CI (GitHub Actions) shows
+    live progress, without changing the on-disk audit format.
     """
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -23,7 +26,18 @@ class TradeLogger:
         obj.setdefault("ts", _ts())
         line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         with self._lock:
-            self._fp.write(line + "\n")
+            # Always try to write the file log first (audit source of truth)
+            try:
+                self._fp.write(line + "\n")
+            except Exception:
+                # Never let logging crash trading; still try to emit to console
+                pass
+            # Mirror to console so it appears in GitHub Actions live logs
+            try:
+                print(line, flush=True)
+            except Exception:
+                # Ignore console failures to keep trading resilient
+                pass
 
     # ---- Emitters (normalized "type" values) ----
     def heartbeat(self, **kw): kw.setdefault("type","HEARTBEAT"); self._write(kw)
@@ -46,5 +60,7 @@ class TradeLogger:
     def eod_summary(self, **kw): kw.setdefault("type","EOD_SUMMARY"); self._write(kw)
 
     def close(self):
-        try: self._fp.close()
-        except Exception: pass
+        try:
+            self._fp.close()
+        except Exception:
+            pass
