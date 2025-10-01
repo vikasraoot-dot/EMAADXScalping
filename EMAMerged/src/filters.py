@@ -11,7 +11,8 @@ def explain_long_gate(row: pd.Series, cfg: Dict,
                       ema_slow_col: str = "ema_slow") -> Tuple[bool, List[str]]:
     """
     Re-run the long entry gate logic but return (ok, reasons).
-    Reasons will include ADX, RSI, EMA slope, price/liquidity, and MTF bias if enabled.
+    Reads thresholds from cfg['filters'] (e.g., adx_threshold) so you can tune them in config.yaml.
+    Reasons may include ADX, RSI, EMA slope, price/liquidity, and MTF bias if enabled.
     """
     reasons: List[str] = []
     fcfg = dict(cfg.get("filters", {}))
@@ -97,7 +98,6 @@ def _compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx.bfill().fillna(0.0)
 
 
-
 def _ensure_rsi(df: pd.DataFrame, rsi_col: str = "rsi", period: int = 14) -> pd.DataFrame:
     """
     If RSI already exists (from strategy), keep it; otherwise compute a simple RSI(14).
@@ -121,17 +121,17 @@ def attach_verifiers(df: pd.DataFrame, cfg: Dict, ema_fast_col: str = "ema_fast"
       - adx (float)
       - ema_slope_pct (float) : pct change of ema_fast
       - rsi (float) : if not already present
-      - verifier booleans are computed in long_ok() using cfg thresholds
+      - dollar_vol_avg (float) when min_dollar_vol is configured
 
     Config keys (under cfg['filters']):
       adx_period: int (default 14)
-      adx_threshold: float (default 25.0)  # stricter trend filter
+      adx_threshold: float (default 25.0)
       rsi_period: int (default 14)
       rsi_min: float | None
       rsi_max: float | None
       slope_threshold_pct: float | None (e.g., 0.0012 for +0.12% per bar)
-      min_price: float | None (e.g., 5.0)  # avoid penny stocks
-      min_dollar_vol: float | None (e.g., 5_000_000)  # avg(close*volume) over window
+      min_price: float | None (e.g., 5.0)
+      min_dollar_vol: float | None (e.g., 5_000_000)
       dollar_vol_window: int (default 20)
     """
     fcfg = dict(cfg.get("filters", {}))
@@ -167,12 +167,12 @@ def attach_verifiers(df: pd.DataFrame, cfg: Dict, ema_fast_col: str = "ema_fast"
 def long_ok(row: pd.Series, cfg: Dict, ema_fast_col: str = "ema_fast", ema_slow_col: str = "ema_slow") -> bool:
     """
     Combines verifiers into a single long-entry gate.
-    Reads thresholds from cfg['filters'] with sensible defaults.
+    All thresholds are read from cfg['filters'] so you can tune via config.yaml.
     """
     fcfg = dict(cfg.get("filters", {}))
 
     # --- ADX trend strength ---
-    adx_th = float(fcfg.get("adx_threshold", 25.0))  # stricter default
+    adx_th = float(fcfg.get("adx_threshold", 25.0))
     if float(row.get("adx", 0.0)) < adx_th:
         return False
 
