@@ -1,58 +1,98 @@
 # === EMAMerged/config.yaml ===
 
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERVALS / PERIODS (reference-style; live loop auto-normalizes to timeframe)
+# ──────────────────────────────────────────────────────────────────────────────
+intervals: ["15m"]            # reference key; normalized to timeframe "15Min"
+periods:
+  "15m": "10d"                # reference key; normalized to history_days=10
+
+# Backward-compat (kept; will be overridden by intervals/periods above if set)
+timeframe: "15Min"
+history_days: 30
+
+# ──────────────────────────────────────────────────────────────────────────────
 # SESSION / DATA
+# ──────────────────────────────────────────────────────────────────────────────
 timezone: "US/Eastern"
 rth_only: true
 rth_start: "09:30"
 rth_end:   "15:55"
 
-run:
-  force_run: 0
-  dry_run: 0
-  
-# Live cadence
-timeframe: "15Min"
-history_days: 30
+# Optional entry windows (in timezone above) – skips midday window
+entry_windows:
+  - { start: "09:30", end: "12:10" }
+  - { start: "12:35", end: "15:55" }
+
 bar_limit: 10000
 feed: "iex"
 
-# Risky behaviors mitigations
-flatten_minutes_before_close: 5     # A: force flatten positions this many minutes before close
-entry_cutoff_min: 20                # A: block NEW entries within last N minutes
+run:
+  force_run: 0
+  dry_run: 0
 
-# POSITION / RISK
+# ──────────────────────────────────────────────────────────────────────────────
+# INDICATORS (reference-friendly names; auto-mapped)
+# ──────────────────────────────────────────────────────────────────────────────
+ema_fast: 9
+ema_slow: 21
+rsi_length: 14        # mapped to filters.rsi_period
+atr_length: 14        # mapped to atr_period for ATR calc
+vol_sma_length: 10
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RISK CONTROLS
+# ──────────────────────────────────────────────────────────────────────────────
+flatten_minutes_before_close: 5     # flatten before close
+entry_cutoff_min: 20                # block NEW entries within last N minutes
+
+# POSITION / SIZING
 allow_shorts: false
 qty: 1
-max_notional_per_trade: 2000
+max_shares_per_trade: 1             # reference knob (enforced in live loop)
+max_open_trades_per_ticker: 1       # reference knob (enforced in live loop)
+max_notional_per_trade: 2000        # hard cap per order
 
-# BRACKET ORDERS
+# ──────────────────────────────────────────────────────────────────────────────
+# BRACKET ORDERS (aligned to reference: ATR stop + R-multiple target)
+# ──────────────────────────────────────────────────────────────────────────────
 brackets:
   enabled: true
-  atr_mult_sl: 1.0            # stop distance = 1.0 * ATR
-  take_profit_r: 1.2          # TP at +1.2R
+  atr_mult_sl: 1.2          # stop distance = 1.2 × ATR   (ref: atr_mult)
+  take_profit_r: 1.8        # TP at +1.8R                  (ref: use_rr_target + rr_target)
 
-# Optional: breakeven bump (single move to BE+ticks at +0.5R)
+# Optional: breakeven bump at partial R
 breakeven:
   enabled: true
-  trigger_r: 0.5              # trigger when ≥ 0.5R
-  bump_ticks: 2               # move stop to entry + 2 ticks
-  tick_size: 0.01             # $0.01/tick
+  trigger_r: 0.5            # at +0.5R, move stop to BE + ticks
+  bump_ticks: 2
+  tick_size: 0.01
 
-# FILTERS (NEW: ADX threshold lives here)
+# ──────────────────────────────────────────────────────────────────────────────
+# FILTERS / GATES (now fully config-driven)
+# ──────────────────────────────────────────────────────────────────────────────
 filters:
-  adx_threshold: 22.0         # <-- change this to tune the ADX gate (e.g., 22.0 or 28.0)
-  # rsi_min: null
-  # rsi_max: null
-  # slope_threshold_pct: null
-  # min_price: null
-  # min_dollar_vol: null
+  adx_threshold: 22.0        # trend strength gate (raise to 25.0 for stricter)
+  rsi_period: 14             # comes from rsi_length above if omitted
+  rsi_min: 52                # reference rsi_long_min
+  rsi_max: 66                # reference rsi_long_max
+  slope_threshold_pct: 0.0008  # require EMA_fast slope ≥ +0.08% per bar
+
+  # Optional extras (leave commented if not needed):
+  # min_price: 5.0
+  # min_dollar_vol: 5000000
   # dollar_vol_window: 20
   # mtf_bias:
   #   enabled: false
 
+# ──────────────────────────────────────────────────────────────────────────────
 # OUTPUT
+# ──────────────────────────────────────────────────────────────────────────────
 results_dir: "results"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# BROKER (kept as-is)
+# ──────────────────────────────────────────────────────────────────────────────
 broker:
   base_url: "https://paper-api.alpaca.markets"
   key: "PK5D0P6J7VQ66PNCOY3E"
