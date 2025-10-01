@@ -6,6 +6,10 @@ rth_only: true
 rth_start: "09:30"
 rth_end:   "15:55"
 
+run:
+  force_run: 1   # TEMP: after-hours test; set back to 0 for live
+  dry_run: 0     # optional; runner accepts it for compatibility
+  
 # Live cadence
 timeframe: "15Min"
 history_days: 30
