@@ -7,8 +7,8 @@ rth_start: "09:30"
 rth_end:   "15:55"
 
 run:
-  force_run: 0   # TEMP: after-hours test; set back to 0 for live
-  dry_run: 0     # optional; runner accepts it for compatibility
+  force_run: 0
+  dry_run: 0
   
 # Live cadence
 timeframe: "15Min"
@@ -37,6 +37,18 @@ breakeven:
   trigger_r: 0.5              # trigger when ≥ 0.5R
   bump_ticks: 2               # move stop to entry + 2 ticks
   tick_size: 0.01             # $0.01/tick
+
+# FILTERS (NEW: ADX threshold lives here)
+filters:
+  adx_threshold: 25.0         # <-- change this to tune the ADX gate (e.g., 22.0 or 28.0)
+  # rsi_min: null
+  # rsi_max: null
+  # slope_threshold_pct: null
+  # min_price: null
+  # min_dollar_vol: null
+  # dollar_vol_window: 20
+  # mtf_bias:
+  #   enabled: false
 
 # OUTPUT
 results_dir: "results"
