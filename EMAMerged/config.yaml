@@ -95,7 +95,7 @@ results_dir: "results"
 # ──────────────────────────────────────────────────────────────────────────────
 broker:
   base_url: "https://paper-api.alpaca.markets"
-  # key: "PK5D0P6J7VQ66PNCOY3E"
-  # secret: "jGs61lhYDGYthVh0K45aJvRK8x7SnseGpNvDO3zg"
+  key: ""     # leave blank (Secrets used instead)
+  secret: ""  # leave blank (Secrets used instead)
 
 # Tickers file still used by market_loop unless SYMBOLS override
