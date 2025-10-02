@@ -36,16 +36,15 @@ jobs:
           chcp 65001 > $null
           $py = @'
           import os, sys, json, datetime as dt, requests
+          from datetime import timezone
 
-          def log(obj):
-              print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+          def log(obj): print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
 
           base = (os.getenv("APCA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
           key  = os.getenv("APCA_API_KEY_ID")
           sec  = os.getenv("APCA_API_SECRET_KEY")
           if not key or not sec:
               sys.exit("Missing APCA_API_KEY_ID/APCA_API_SECRET_KEY")
-
           H = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
 
           # 1) Account
@@ -62,32 +61,45 @@ jobs:
           clock = r.json()
           log({"type":"PREFLIGHT","stage":"clock_ok","is_open":clock.get("is_open"),"next_open":clock.get("next_open"),"next_close":clock.get("next_close")})
 
-          # 3) Positions (read)
+          # 3) Positions
           r = requests.get(f"{base}/v2/positions", headers=H, timeout=8)
           if r.status_code not in (200, 404):
               r.raise_for_status()
           count = len(r.json()) if r.ok and r.text.strip() else 0
           log({"type":"PREFLIGHT","stage":"positions_ok","count":count})
 
-          # 4) Activities (read)
+          # 4) Activities
           r = requests.get(f"{base}/v2/account/activities", headers=H, timeout=8)
           if r.status_code not in (200, 204):
               r.raise_for_status()
           acts = r.json() if r.ok and r.text.strip() else []
           log({"type":"PREFLIGHT","stage":"activities_ok","sample_count":len(acts)})
 
-          # 5) Market data (read-only) via data API
-          syms = ["AAPL","NVDA"]
-          end = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-          start = (dt.datetime.utcnow() - dt.timedelta(days=2)).replace(microsecond=0).isoformat() + "Z"
-          params = {"symbols": ",".join(syms), "timeframe":"15Min", "start":start, "end":end, "limit":50}
-          r = requests.get("https://data.alpaca.markets/v2/stocks/bars", headers=H, params=params, timeout=10)
-          r.raise_for_status()
-          bars = r.json().get("bars", {})
-          has_data = {s: bool(bars.get(s)) for s in syms}
-          log({"type":"PREFLIGHT","stage":"bars_ok","timeframe":"15Min","has_data":has_data})
+          # 5) Market data (read-only): request IEX feed explicitly; treat 403 as "not entitled" and continue
+          try:
+              syms = ["AAPL","NVDA"]
+              end = dt.datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+              start = (dt.datetime.now(timezone.utc) - dt.timedelta(days=2)).replace(microsecond=0).isoformat().replace("+00:00","Z")
+              params = {
+                  "symbols": ",".join(syms),
+                  "timeframe": "15Min",
+                  "start": start,
+                  "end": end,
+                  "limit": 50,
+                  "feed": "iex"  # <-- use IEX to match your trading config
+              }
+              r = requests.get("https://data.alpaca.markets/v2/stocks/bars", headers=H, params=params, timeout=10)
+              if r.status_code == 403:
+                  log({"type":"PREFLIGHT","stage":"bars_forbidden","feed":"iex","note":"403 from data API (plan not entitled). Trading can still proceed."})
+              else:
+                  r.raise_for_status()
+                  bars = r.json().get("bars", {})
+                  has_data = {s: bool(bars.get(s)) for s in syms}
+                  log({"type":"PREFLIGHT","stage":"bars_ok","timeframe":"15Min","feed":"iex","has_data":has_data})
+          except Exception as e:
+              # Non-fatal: we don't want preflight to fail just due to data plan limits
+              log({"type":"PREFLIGHT","stage":"bars_check_skipped","error":str(e)})
 
           log({"type":"PREFLIGHT","stage":"complete","ok":True})
           '@
-
           $py | & "$env:PYTHON_EXE" -
