@@ -5,7 +5,7 @@ import datetime as dt
 from typing import Dict, List, Any, Optional
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
-from EMAMerged.src.tradelogger import TradeLogger
+from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
 from EMAMerged.src.data import (
     fetch_latest_bars,     # expects (symbols, timeframe, history_days, feed) → dict[sym]->DataFrame
