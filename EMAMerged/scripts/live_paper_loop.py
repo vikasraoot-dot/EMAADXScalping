@@ -16,6 +16,7 @@ from EMAMerged.src.config_compat import normalize_config
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.execution import execute_long_with_oco, get_positions
 from EMAMerged.src.execution_creds import configure_alpaca
+from EMAMerged.src.oco import ensure_oco_for_long
 
 def _tz(cfg) -> pytz.BaseTzInfo:
     try:
