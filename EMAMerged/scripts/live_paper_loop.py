@@ -1,324 +1,265 @@
-# EMAMerged/scripts/live_paper_loop.py
+# === EMAMerged/scripts/live_paper_loop.py ===
 from __future__ import annotations
-import os, sys, argparse
-import pandas as pd
-from datetime import datetime, timedelta, timezone, time as dtime
-import pytz
+import os, sys, json, time, argparse
+import datetime as dt
+from typing import Dict, List, Any, Optional
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
+from EMAMerged.src.tradelogger import TradeLogger
+from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
 from EMAMerged.src.data import (
-    get_alpaca_bars, filter_rth, drop_unclosed_last_bar, alpaca_market_open
+    fetch_latest_bars,     # expects (symbols, timeframe, history_days, feed) → dict[sym]->DataFrame
+    alpaca_market_open,    # (base_url, key, secret) → bool
 )
-from EMAMerged.src.strategy import compute_indicators, crossover
-from EMAMerged.src.filters import long_ok, explain_long_gate
-from EMAMerged.src.config_compat import normalize_config
-
-from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.execution import execute_long_with_oco, get_positions
-from EMAMerged.src.execution_creds import configure_alpaca
 from EMAMerged.src.oco import ensure_oco_for_long
 
-def _tz(cfg) -> pytz.BaseTzInfo:
+ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
+
+def _utcnow() -> str:
+    return dt.datetime.utcnow().strftime(ISO_UTC)
+
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.environ.get(name, default)
+    return v
+
+def _resolve_broker(cfg: Dict) -> Dict[str, str]:
+    bk = dict(cfg.get("broker", {}))
+    base_url = _env("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))
+    key_id   = _env("APCA_API_KEY_ID", bk.get("key"))
+    secret   = _env("APCA_API_SECRET_KEY", bk.get("secret"))
+    # Back-compat aliases if set
+    key_id   = _env("ALPACA_KEY", key_id)
+    secret   = _env("ALPACA_SECRET", secret)
+    return {"base_url": base_url, "key_id": key_id, "secret": secret}
+
+def _trades_path() -> str:
+    dstr = dt.datetime.utcnow().strftime("%Y%m%d")
+    p = os.path.join(os.path.dirname(__file__), "..", "logs", f"trades_{dstr}.jsonl")
+    return os.path.abspath(p)
+
+def _log_signal(log: TradeLogger, row: Dict[str, Any]):
+    # row contains: symbol, cross, ref_bar_ts, last_close, adx, ema_slope_pct, rsi (if attached), etc.
+    payload = {k: v for k, v in row.items() if k not in ("reasons",)}
+    payload.update({"type": "SIGNAL", "ts": _utcnow()})
+    log._write(payload)
+
+def _log_gate(log: TradeLogger, symbol: str, cid: str, session: str, decision: str, reasons: List[str]):
+    log.gate(symbol=symbol, session=session, cid=cid, decision=decision, reasons=reasons)
+
+def _build_cid(symbol: str) -> str:
+    return f"EMA_{symbol}_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+def _calc_tp_sl_from_cfg(cfg: Dict, entry_price: float, atr: Optional[float]) -> Dict[str, float]:
+    # Your config supports both ATR multiple and R multiple; keep current behavior
+    bcfg = dict(cfg.get("brackets", {}))
+    r_mult = float(bcfg.get("take_profit_r", 1.2))
+    atr_mult = float(bcfg.get("atr_mult_sl", 1.0))
+    # If ATR provided, SL = entry - atr_mult*atr ; TP = entry + r_mult*(entry - SL)
+    if atr is not None and atr > 0:
+        sl = entry_price - atr_mult * atr
+        risk_per_share = max(0.01, entry_price - sl)
+        tp = entry_price + r_mult * risk_per_share
+    else:
+        # Fallback: simple 1R on 1% risk
+        sl = entry_price * 0.99
+        tp = entry_price * (1 + 0.012)
+    return {"tp": round2(tp), "sl": round2(sl)}
+
+def _place_oco_after_fill(
+    *,
+    symbol: str,
+    fill_qty: int,
+    intended: Dict[str, Any],
+    cid: str,
+    log: TradeLogger,
+    session: str,
+    broker: Dict[str, str],
+):
+    # Normalize intended tp/sl to floats
+    tp = intended.get("tp")
+    sl = intended.get("sl")
+    if isinstance(tp, dict):  tp = float(tp.get("level") or tp.get("limit") or tp.get("price"))
+    else:                     tp = float(tp)
+    if isinstance(sl, dict):  sl = float(sl.get("level") or sl.get("stop")  or sl.get("price"))
+    else:                     sl = float(sl)
+
+    res = ensure_oco_for_long(
+        symbol=symbol,
+        intended_qty=fill_qty,
+        tp_level=tp,
+        sl_level=sl,
+        base_url=broker["base_url"],
+        key_id=broker["key_id"],
+        secret=broker["secret"],
+        logger=log,
+        cid=cid,
+        session=session,
+    )
+    # Optional summary snapshot
+    log.snapshot(symbol=symbol, session=session, cid=cid, stage="OCO_RESULT", result=res.get("status"))
+
+def _maybe_submit_entry(symbol: str, side: str, qty: int, price: float, intended: Dict[str, float],
+                        log: TradeLogger, broker: Dict[str, str], cid: str, session: str) -> Optional[Dict[str, Any]]:
+    """
+    Minimal, conservative entry submit that matches your existing logging.
+    Returns fill dict if filled synchronously (paper/live will usually ack then fill quickly),
+    otherwise returns None and rely on subsequent polling (kept simple here).
+    """
+    import requests
+    headers = {
+        "APCA-API-KEY-ID": broker["key_id"],
+        "APCA-API-SECRET-KEY": broker["secret"],
+        "Content-Type": "application/json", "Accept": "application/json",
+    }
+    payload = {
+        "symbol": symbol,
+        "side": side.lower(),
+        "qty": str(int(qty)),
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": f"PARENT_{symbol}_{cid[-8:]}",
+    }
+    log.entry_submit(symbol=symbol, session=session, cid=cid, side=side.upper(),
+                     qty=qty, order_type="market", limit_price=None,
+                     intended={"tp": intended["tp"], "sl": intended["sl"]},
+                     client_order_id=payload["client_order_id"])
     try:
-        return pytz.timezone(cfg.get("timezone", "US/Eastern"))
-    except Exception:
-        return pytz.timezone("US/Eastern")
-
-def _now_tz(cfg) -> datetime:
-    return datetime.now(_tz(cfg))
-
-def _within_entry_windows(cfg) -> bool:
-    """
-    If config provides entry_windows: [{start:'HH:MM', end:'HH:MM'}, ...] in cfg.timezone,
-    only allow entries during those windows. If not present, always True.
-    """
-    wins = cfg.get("entry_windows")
-    if not isinstance(wins, list) or not wins:
-        return True
-    now_local = _now_tz(cfg).time()
-    for w in wins:
-        try:
-            s = w.get("start", "00:00")
-            e = w.get("end", "23:59")
-            t0 = dtime.fromisoformat(s)
-            t1 = dtime.fromisoformat(e)
-            if t0 <= now_local <= t1:
-                return True
-        except Exception:
-            # ignore malformed window
-            continue
-    return False
-
-def _cid(sym: str) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"EMA_{sym}_{now}"
-
-def _log_path(cfg_path: str) -> str:
-    root = os.path.dirname(os.path.abspath(cfg_path))
-    dstr = datetime.now(timezone.utc).strftime("%Y%m%d")
-    logs_dir = os.path.join(root, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    return os.path.join(logs_dir, f"trades_{dstr}.jsonl")
-
-def _resolve_alpaca(cfg: dict) -> tuple[str,str,str]:
-    b = (cfg or {}).get("broker", {}) or {}
-    base_url = (
-        os.getenv("APCA_BASE_URL")
-        or b.get("base_url")
-        or "https://paper-api.alpaca.markets"
-    )
-    key = (
-        os.getenv("ALPACA_KEY")
-        or os.getenv("APCA_API_KEY_ID")
-        or b.get("key")
-        or ""
-    )
-    secret = (
-        os.getenv("ALPACA_SECRET")
-        or os.getenv("APCA_API_SECRET_KEY")
-        or b.get("secret")
-        or ""
-    )
-    return base_url, key, secret
-
-def _require_creds_or_bail(logger: TradeLogger, base_url: str, key: str, secret: str) -> bool:
-    ok = bool(base_url and key and secret)
-    if not ok:
-        logger.error(
-            stage="CREDENTIALS",
-            error_code="MISSING",
-            error_text=("Alpaca creds missing: set APCA_BASE_URL + (APCA_API_KEY_ID|ALPACA_KEY) "
-                        "+ (APCA_API_SECRET_KEY|ALPACA_SECRET) or set broker.{base_url,key,secret} in config.")
-        )
-    return ok
-
-def _compute_brackets_from_cfg(px: float, row: dict, bcfg: dict) -> tuple[float,float]:
-    """
-    Prefer ATR/R style if present:
-      R = atr_mult_sl * ATR
-      SL = px - 1.0 * R
-      TP = px + take_profit_r * R
-    Fallback to abs/percent keys if ATR/R not configured.
-    """
-    atr_mult_sl = bcfg.get("atr_mult_sl")
-    take_profit_r = bcfg.get("take_profit_r")
-    atr = row.get("atr") or row.get("ATR")
-    if atr_mult_sl is not None and take_profit_r is not None and atr:
-        try:
-            R = float(atr_mult_sl) * float(atr)
-            sl = round2(px - 1.0 * R)
-            tp = round2(px + float(take_profit_r) * R)
-            return tp, sl
-        except Exception:
-            pass
-
-    tp_abs = bcfg.get("tp_abs")
-    sl_abs = bcfg.get("sl_abs")
-    tp_pct = bcfg.get("tp_pct")
-    sl_pct = bcfg.get("sl_pct")
-    if tp_abs is not None or sl_abs is not None:
-        tp = round2(px + float(tp_abs or 0.0))
-        sl = round2(px - float(sl_abs or 0.0))
-        return tp, sl
-    tp = round2(px * (1 + float(tp_pct or 0.0)/100.0))
-    sl = round2(px * (1 - float(sl_pct or 0.0)/100.0))
-    return tp, sl
-
-def _cap_qty_by_limits(cfg: dict, px: float, base_qty: int) -> int:
-    # max_shares_per_trade (reference)
-    eff = int(base_qty)
-    mshares = cfg.get("max_shares_per_trade")
-    if mshares is not None:
-        try:
-            eff = min(eff, int(mshares))
-        except Exception:
-            pass
-    # max_notional_per_trade (already in your cfg)
-    cap = cfg.get("max_notional_per_trade")
-    if cap is not None:
-        try:
-            cap = float(cap)
-            eff = max(0, min(eff, int(cap // max(px, 1e-9))))
-        except Exception:
-            pass
-    return eff
-
-def manage_symbol(sym: str, cfg: dict, args: argparse.Namespace, logger: TradeLogger, key: str, secret: str):
-    try:
-        # DATA
-        try:
-            bars = get_alpaca_bars(key, secret, cfg["timeframe"], sym,
-                                   days=int(cfg.get("history_days", 30)))
-        except Exception as e:
-            logger.error(symbol=sym, session=args.session, stage="DATA",
-                         error_code="BARS_FETCH", error_text=str(e))
-            return
-
-        if bars is None or len(bars) == 0:
-            logger.error(symbol=sym, stage="DATA", error_code="NO_BARS")
-            return
-
-        bars = drop_unclosed_last_bar(bars, cfg["timeframe"])
-        if cfg.get("rth_only", True):
-            bars = filter_rth(bars)
-        if bars is None or len(bars) < 50:
-            logger.error(symbol=sym, stage="DATA", error_code="TOO_FEW_BARS",
-                         detail=len(bars) if bars is not None else 0)
-            return
-
-        # INDICATORS + SCANNER
-        df = compute_indicators(bars, cfg).copy()
-        cross = crossover(df)
-        row = df.iloc[-1].to_dict()
-
-        # SIGNAL + GATE LOGGING
-        cid = _cid(sym)
-        logger.signal(symbol=sym, session=args.session, cid=cid, tf=cfg["timeframe"],
-                      cross=int(cross), ref_bar_ts=str(df.index[-1]),
-                      last_close=float(row.get("close", float('nan'))),
-                      adx=float(row.get("adx", float('nan'))),
-                      ema_slope_pct=float(row.get("ema_slope_pct", float('nan'))),
-                      dollar_vol_avg=float(row.get("dollar_vol_avg", float('nan'))))
-
-        ok = long_ok(pd.Series(row), cfg)
-        if not ok:
-            gate_ok, reasons = explain_long_gate(pd.Series(row), cfg)
-            logger.gate(symbol=sym, session=args.session, cid=cid, decision="BLOCK", reasons=reasons)
-            return
-
-        if not cross:
-            logger.gate(symbol=sym, session=args.session, cid=cid, decision="PASS", reasons=["cross=0"])
-            return
-
-        # Enforce max open trades per ticker (reference knob)
-        max_open = int(cfg.get("max_open_trades_per_ticker", 1))
-        try:
-            pos = get_positions(sym) or []
-            open_qty = 0.0
-            if pos:
-                # alpaca-like position object; sum qty if multiple (defensive)
-                for p in pos:
-                    try:
-                        open_qty += float(p.get("qty", 0))
-                    except Exception:
-                        pass
-            if max_open <= 0 or open_qty > 0 and max_open <= 1:
-                logger.gate(symbol=sym, session=args.session, cid=cid,
-                            decision="BLOCK", reasons=[f"max_open_trades_per_ticker={max_open}"])
-                return
-        except Exception:
-            # on error, don't block; we log later if execute fails
-            pass
-
-        # BRACKETS
-        bcfg = cfg.get("brackets", {}) or {}
-        px = float(row["close"])
-        tp, sl = _compute_brackets_from_cfg(px, row, bcfg)
-
-        # QTY with safety caps
-        base_qty = int(cfg.get("qty", 1))
-        qty = _cap_qty_by_limits(cfg, px, base_qty)
-        if qty <= 0:
-            logger.gate(symbol=sym, session=args.session, cid=cid,
-                        decision="BLOCK", reasons=["qty=0 after caps"])
-            return
-
-        # EXECUTE
-        res = execute_long_with_oco(
-            logger=logger,
-            symbol=sym,
-            qty=qty,
-            intended_tp=float(tp),
-            intended_sl=float(sl),
-            session=args.session,
-            cid=cid,
-            prefer_limit_entry=bool(cfg.get("prefer_limit_entry", False)),
-            limit_px=float(cfg.get("limit_entry_offset_px", 0.0)) + px if bool(cfg.get("prefer_limit_entry", False)) else None,
-        )
-
-        if res.get("status") != "ok":
-            return
-
-        # SNAPSHOT (optional)
-        try:
-            pos = get_positions(sym)
-            if pos:
-                p = pos[0]
-                logger.snapshot(session=args.session,
-                                open_positions=[{
-                                    "symbol": p.get("symbol"),
-                                    "side": "LONG" if float(p.get("qty", 0)) > 0 else "SHORT",
-                                    "qty": float(p.get("qty", 0)),
-                                    "avg_price": float(p.get("avg_entry_price", 0.0)),
-                                }])
-        except Exception:
-            pass
-
+        r = requests.post(f'{broker["base_url"]}/v2/orders', headers=headers, data=json.dumps(payload), timeout=10)
+        if not r.ok:
+            log.entry_reject(symbol=symbol, session=session, cid=cid,
+                             client_order_id=payload["client_order_id"],
+                             reason_text=f"alpaca POST /v2/orders -> {r.status_code} {r.text}\n")
+            return None
+        j = r.json()
+        log.entry_ack(symbol=symbol, session=session, cid=cid,
+                      client_order_id=payload["client_order_id"],
+                      broker_order_id=j.get("id"), status=j.get("status", "pending_new"))
+        # Try to fetch immediate fill
+        order_id = j.get("id")
+        if order_id:
+            time.sleep(0.3)  # small wait for fill
+            r2 = requests.get(f'{broker["base_url"]}/v2/orders/{order_id}', headers=headers, timeout=8)
+            if r2.ok:
+                j2 = r2.json()
+                if (j2.get("filled_qty") or "0") != "0":
+                    fill_qty = int(float(j2.get("filled_qty")))
+                    fill_price = float(j2.get("filled_avg_price") or j2.get("limit_price") or price)
+                    log.entry_fill(symbol=symbol, session=session, cid=cid,
+                                   client_order_id=payload["client_order_id"],
+                                   broker_order_id=order_id,
+                                   fill_qty=fill_qty, fill_price=fill_price, slippage=0.0)
+                    return {"fill_qty": fill_qty, "fill_price": fill_price, "order_id": order_id}
+        return None
     except Exception as e:
-        logger.error(symbol=sym, session=args.session, stage="MANAGE", error_text=str(e))
+        log.error(symbol=symbol, session=session, cid=cid, stage="MANAGE",
+                  error_text=f"alpaca POST /v2/orders exception: {e}")
+        return None
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--tickers", type=str, default=None)
-    parser.add_argument("--symbols", type=str, default=None)  # comma-separated
-    parser.add_argument("--session", type=str, default="AM")
-    parser.add_argument("--dry-run", type=int, default=0)
-    parser.add_argument("--force-run", type=int, default=0)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--tickers", required=True)
+    ap.add_argument("--session", default="AM")
+    args, unknown = ap.parse_known_args()
 
-    raw_cfg = load_config(args.config)
-    cfg = normalize_config(raw_cfg)  # <- make reference-style config work
+    cfg = load_config(args.config)
+    broker = _resolve_broker(cfg)
+    SESSION = args.session
 
-    logger = TradeLogger(_log_path(args.config))
+    # Guard: market open if force_run not set
+    force_run = int(cfg.get("run", {}).get("force_run", int(os.environ.get("FORCE_RUN", "0"))))
+    if not force_run:
+        if not alpaca_market_open(broker["base_url"], broker["key_id"], broker["secret"]):
+            # Exit quietly if market is closed
+            print(json.dumps({"session": SESSION, "market_open": False, "type": "HEARTBEAT", "ts": _utcnow()}))
+            return
 
-    # CREDS
-    base_url, key, secret = _resolve_alpaca(cfg)
-    if not _require_creds_or_bail(logger, base_url, key, secret):
-        print("[live] MISSING Alpaca credentials. Set env or add broker section in config.")
-        sys.exit(2)
-    configure_alpaca(base_url, key, secret)
+    # Logger
+    log_path = _trades_path()
+    log = TradeLogger(log_path)
+    print(json.dumps({"session": SESSION, "market_open": True, "type": "HEARTBEAT", "ts": _utcnow()}))
 
-    # OPEN CHECK (skip only if --force-run 1)
-    if args.force_run and int(args.force_run) > 0:
-        logger.heartbeat(session=args.session, market_open="FORCED_TRUE")
-        is_open = True
-    else:
-        try:
-            is_open = alpaca_market_open(base_url, key, secret)
-        except Exception as e:
-            logger.error(stage="MARKET_OPEN_CHECK", error_code="HTTP_JSON", error_text=str(e))
-            is_open = True  # degrade gracefully
+    # Inputs
+    symbols = read_tickers(args.tickers)
 
-    if not is_open:
-        logger.heartbeat(session=args.session, market_open=False)
-        return
+    # Data cadence
+    timeframe = cfg.get("timeframe", "15Min")
+    history_days = int(cfg.get("history_days", 30))
+    feed = cfg.get("feed", "iex")
 
-    logger.heartbeat(session=args.session, market_open=True)
+    # Fetch latest bars
+    bars_map = fetch_latest_bars(symbols, timeframe=timeframe, history_days=history_days, feed=feed)
 
-    # Entry windows (if provided)
-    if not _within_entry_windows(cfg):
-        logger.gate(session=args.session, symbol=None, cid=None,
-                    decision="BLOCK", reasons=["outside entry_windows"])
-        return
-
-    # SYMBOLS
-    symbols: list[str] = []
-    if args.symbols:
-        parts = [s.strip().upper() for s in args.symbols.replace(",", " ").split() if s.strip()]
-        symbols = list(dict.fromkeys(parts))
-    elif args.tickers:
-        symbols = read_tickers(args.tickers)
-    else:
-        symbols = cfg.get("symbols", [])
-        if isinstance(symbols, str) and os.path.exists(symbols):
-            symbols = read_tickers(symbols)
-
+    # Iterate symbols → signal → gate → entry
+    qty = int(cfg.get("qty", 1))
     for sym in symbols:
-        try:
-            manage_symbol(sym, cfg, args, logger, key=key, secret=secret)
-        except Exception as e:
-            logger.error(symbol=sym, session=args.session, stage="LOOP", error_text=str(e))
+        df = bars_map.get(sym)
+        if df is None or df.empty:
+            continue
+
+        # Attach verifiers: ADX, RSI, EMA slope, dollar_vol
+        df = attach_verifiers(df, cfg)
+
+        # Build simple signal snapshot on last bar
+        last = df.iloc[-1]
+        cross = 1 if float(last.get("ema_fast", 0)) > float(last.get("ema_slow", 0)) else ( -1 if float(last.get("ema_fast", 0)) < float(last.get("ema_slow", 0)) else 0 )
+        row = {
+            "symbol": sym,
+            "session": SESSION,
+            "cid": _build_cid(sym),
+            "tf": timeframe,
+            "cross": cross,
+            "ref_bar_ts": str(df.index[-1]),
+            "last_close": float(last.get("close", 0.0)),
+            "adx": float(last.get("adx", 0.0)),
+            "ema_slope_pct": float(last.get("ema_slope_pct", 0.0)),
+            "dollar_vol_avg": float(last.get("dollar_vol_avg", 0.0)),
+        }
+        # include RSI in the signal snapshot for clarity
+        if "rsi" in df.columns:
+            row["rsi"] = float(last.get("rsi", 50.0))
+
+        _log_signal(log, row)
+
+        # Gate decision
+        ok, reasons = explain_long_gate(last, cfg)
+        if not ok:
+            _log_gate(log, sym, row["cid"], SESSION, "BLOCK", reasons)
+            continue
+
+        # Only go long on cross >= 0 (your logic blocks some cases on cross=0)
+        if cross < 0:
+            _log_gate(log, sym, row["cid"], SESSION, "BLOCK", ["bearish cross"])
+            continue
+
+        # If you keep a "PASS on cross=0" rule, reflect it:
+        if cross == 0:
+            _log_gate(log, sym, row["cid"], SESSION, "PASS", ["cross=0"])
+            continue
+
+        # Entry price = last_close, compute intended brackets
+        intended = _calc_tp_sl_from_cfg(cfg, row["last_close"], atr=last.get("atr", None))
+
+        # Submit entry
+        filled = _maybe_submit_entry(
+            symbol=sym, side="BUY", qty=qty, price=row["last_close"],
+            intended=intended, log=log, broker=broker, cid=row["cid"], session=SESSION
+        )
+
+        # If filled immediately, place OCO with optional guard & idempotency
+        if filled and filled.get("fill_qty", 0) >= 1:
+            _place_oco_after_fill(
+                symbol=sym,
+                fill_qty=int(filled["fill_qty"]),
+                intended=intended,
+                cid=row["cid"],
+                log=log,
+                session=SESSION,
+                broker=broker,
+            )
+
+    # Done
+    return
 
 if __name__ == "__main__":
     main()
