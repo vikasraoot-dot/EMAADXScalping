@@ -2,7 +2,7 @@ name: EMA Live Paper (loop AM)
 
 on:
   schedule:
-    # 13:15 UTC ≈ 9:15 ET during DST. GitHub cron is always UTC.
+    # 13:30 UTC ≈ 6:30 PT (cron is UTC)
     - cron: "30 13 * * 1-5"
   workflow_dispatch:
 
@@ -12,64 +12,42 @@ concurrency:
 
 jobs:
   trade:
-    runs-on: [self-hosted, windows]   # local Windows runner
-    timeout-minutes: 600              # ~6h window
-    defaults:
-      run:
-        shell: powershell
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 600
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set Python path
+      - name: Ensure Python path
+        shell: pwsh
         run: |
-          echo "PYTHON_EXE=C:\Program Files\Python313\python.exe" >> $env:GITHUB_ENV
-
-      - name: Show Python
-        run: |
-          & "$env:PYTHON_EXE" --version
-          & "$env:PYTHON_EXE" -c "import sys; print(sys.executable)"
+          $python = (Get-Command python.exe).Source
+          echo "PYTHON_EXE=$python" >> $env:GITHUB_ENV
 
       - name: Install deps
+        shell: pwsh
         run: |
           & "$env:PYTHON_EXE" -m pip install --upgrade pip
           & "$env:PYTHON_EXE" -m pip install -r EMAMerged/requirements.txt
 
-      - name: Set PYTHONPATH
-        run: |
-          echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+      - name: Run market loop (paper trading)
+        shell: pwsh
+        env:
+          # ✅ Correct envs your code actually reads
+          APCA_BASE_URL: https://paper-api.alpaca.markets
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
-      - name: Force UTF-8 (PowerShell + Python)
+          # (Optional) back-compat aliases also understood by your code
+          ALPACA_KEY:   ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET:${{ secrets.ALPACA_SECRET_KEY }}
+
+          # Control flags
+          DRY_RUN:  "0"
+          FORCE_RUN: "0"
+
+          PYTHONUNBUFFERED: "1"
         run: |
           chcp 65001 > $null
-          $env:PYTHONUTF8 = "1"
-          $env:PYTHONIOENCODING = "utf-8"
-          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          echo "PYTHONUTF8=1"            >> $env:GITHUB_ENV
-          echo "PYTHONIOENCODING=utf-8"  >> $env:GITHUB_ENV
-
-      - name: Ensure Alpaca base URL
-        run: |
-          $val = "${{ secrets.ALPACA_BASE_URL }}".Trim()
-          if (-not $val) { $val = "https://paper-api.alpaca.markets" }
-          echo "ALPACA_BASE_URL=$val"   >> $env:GITHUB_ENV
-          echo "APCA_API_BASE_URL=$val" >> $env:GITHUB_ENV
-          Write-Host "Using Alpaca URL: $val"
-
-      - name: Start AM session loop
-        env:
-          # Alpaca creds
-          ALPACA_API_KEY:    ${{ secrets.ALPACA_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
-
-          # Control flags for the one-shot script it calls
-          DRY_RUN:  "0"   # set to "0" to go live
-          FORCE_RUN: "0"  # the outer loop already gates on RTH
-
-          # (Optional) override & debugging
-          # SYMBOLS: "AAPL,MSFT"      # uncomment to override tickers file
-          # FAST_LOOP: "1"            # wakes every 1s for quick debug
-
-          PYTHONUNBUFFERED: "1"   # stream logs live
-        run: |
+          echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
           & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/market_loop.py
