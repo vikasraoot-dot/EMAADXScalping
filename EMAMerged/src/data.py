@@ -5,6 +5,8 @@ import pandas as pd
 import pytz
 import requests
 import time
+import os
+
 
 # ------------------------
 # Resilient HTTP wrapper
@@ -206,3 +208,55 @@ def patch_order(base_url: str, key: str, secret: str, order_id: str, **fields) -
     url = f"{base_url.rstrip('/')}/v2/orders/{order_id}"
     r = _req_with_retry("PATCH", url, headers=_headers(key, secret), timeout=20, json=fields)
     return r.json() if r.text else {}
+def fetch_latest_bars(
+    symbols: list[str],
+    *,
+    timeframe: str = "15Min",
+    history_days: int = 30,
+    feed: str = "iex",
+    # RTH controls (align with your config defaults)
+    rth_only: bool = True,
+    tz_name: str = "US/Eastern",
+    rth_start: str = "09:30",
+    rth_end: str = "15:55",
+    allowed_windows: Optional[List[dict]] = None,
+    # Limits/creds
+    bar_limit: int = 10000,
+    key: Optional[str] = None,
+    secret: Optional[str] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Convenience wrapper used by live_paper_loop:
+      - fetches recent bars for each symbol
+      - drops the still-forming last bar (to avoid lookahead)
+      - optionally filters to regular trading hours and allowed entry windows
+    """
+    # Resolve API creds from args or environment
+    key = key or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY", "")
+    secret = secret or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET", "")
+
+    out: Dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        df = get_alpaca_bars(
+            key=key,
+            secret=secret,
+            timeframe=timeframe,
+            symbol=sym,
+            history_days=history_days,
+            feed=feed,
+            limit=int(bar_limit),
+        )
+        if df.empty:
+            out[sym] = df
+            continue
+
+        # Drop any unclosed/partial last bar for the given timeframe
+        df = drop_unclosed_last_bar(df, timeframe)
+
+        # Filter to RTH + optional entry windows
+        if rth_only:
+            df = filter_rth(df, tz_name=tz_name, rth_start=rth_start, rth_end=rth_end, allowed_windows=allowed_windows)
+
+        out[sym] = df
+
+    return out
