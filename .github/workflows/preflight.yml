@@ -1,0 +1,91 @@
+name: Preflight (Alpaca Auth & Readiness)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  preflight:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Python path
+        shell: pwsh
+        run: |
+          $python = (Get-Command python.exe).Source
+          echo "PYTHON_EXE=$python" >> $env:GITHUB_ENV
+
+      - name: Install minimal deps (requests)
+        shell: pwsh
+        run: |
+          & "$env:PYTHON_EXE" -m pip install --upgrade pip
+          & "$env:PYTHON_EXE" -m pip install requests
+
+      - name: Preflight checks (no trading, no code changes)
+        shell: pwsh
+        env:
+          APCA_BASE_URL: https://paper-api.alpaca.markets
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          # Inline Python: validates account, clock, positions, activities, and bars (read-only)
+          & "$env:PYTHON_EXE" - << 'PY'
+          import os, sys, json, datetime as dt, time
+          import requests
+
+          def log(obj):
+              print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+
+          base = (os.getenv("APCA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
+          key  = os.getenv("APCA_API_KEY_ID")
+          sec  = os.getenv("APCA_API_SECRET_KEY")
+          if not key or not sec:
+              sys.exit("Missing APCA_API_KEY_ID/APCA_API_SECRET_KEY")
+
+          H = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
+
+          # 1) Account check (auth & status)
+          r = requests.get(f"{base}/v2/account", headers=H, timeout=8)
+          if r.status_code == 401:
+              sys.exit("401 Unauthorized from /v2/account – check Secrets and base URL.")
+          r.raise_for_status()
+          acct = r.json()
+          log({"type":"PREFLIGHT","stage":"account_ok","status":acct.get("status","?")})
+
+          # 2) Market clock (connectivity & open/close info)
+          r = requests.get(f"{base}/v2/clock", headers=H, timeout=8)
+          r.raise_for_status()
+          clock = r.json()
+          log({"type":"PREFLIGHT","stage":"clock_ok","is_open":clock.get("is_open"),"next_open":clock.get("next_open"),"next_close":clock.get("next_close")})
+
+          # 3) Positions (read access)
+          r = requests.get(f"{base}/v2/positions", headers=H, timeout=8)
+          if r.status_code not in (200, 404):  # 404 when none for some brokers
+              r.raise_for_status()
+          count = len(r.json()) if r.ok else 0
+          log({"type":"PREFLIGHT","stage":"positions_ok","count":count})
+
+          # 4) Recent activities (read access)
+          r = requests.get(f"{base}/v2/account/activities", headers=H, timeout=8)
+          if r.status_code not in (200, 204):
+              r.raise_for_status()
+          acts = r.json() if r.ok and r.text.strip() else []
+          log({"type":"PREFLIGHT","stage":"activities_ok","sample_count":len(acts)})
+
+          # 5) Market data read (bars) – use v2/stocks/bars for a couple symbols
+          # NOTE: This is read-only; adjust symbols if you want different checks.
+          syms = ["AAPL","NVDA"]
+          end = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+          start = (dt.datetime.utcnow() - dt.timedelta(days=2)).replace(microsecond=0).isoformat() + "Z"
+          params = {"symbols": ",".join(syms), "timeframe":"15Min", "start":start, "end":end, "limit":50}
+          r = requests.get("https://data.alpaca.markets/v2/stocks/bars", headers=H, params=params, timeout=10)
+          r.raise_for_status()
+          bars = r.json().get("bars", {})
+          has_data = {s: bool(bars.get(s)) for s in syms}
+          log({"type":"PREFLIGHT","stage":"bars_ok","timeframe":"15Min","has_data":has_data})
+
+          log({"type":"PREFLIGHT","stage":"complete","ok":True})
+          PY
