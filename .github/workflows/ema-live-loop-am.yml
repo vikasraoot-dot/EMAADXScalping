@@ -1,5 +1,4 @@
 name: EMA Live Paper (loop AM)
-
 on:
   schedule:
     # 13:30 UTC ≈ 6:30 PT (cron is UTC)
