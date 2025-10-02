@@ -88,5 +88,6 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           chcp 65001 > $null
-          echo "PYTHONPATH=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+          # 👇 set PYTHONPATH for THIS step (so Python can import EMAMerged)
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE"
           & "$env:PYTHON_EXE" -X utf8 -u EMAMerged/scripts/market_loop.py
