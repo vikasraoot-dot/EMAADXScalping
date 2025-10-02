@@ -39,7 +39,7 @@ jobs:
 
           # (Optional) back-compat aliases also understood by your code
           ALPACA_KEY:   ${{ secrets.ALPACA_KEY_ID }}
-          ALPACA_SECRET:${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET_KEY }}
 
           # Control flags
           DRY_RUN:  "0"
