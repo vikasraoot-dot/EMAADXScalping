@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 _ISO = "%Y-%m-%dT%H:%M:%SZ"
 
 def _ts() -> str:
-    return dt.datetime.utcnow().strftime(_ISO)
+    return dt.datetime.now(dt.UTC).strftime(_ISO)
 
 class TradeLogger:
     """
