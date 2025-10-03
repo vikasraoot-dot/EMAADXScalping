@@ -6,16 +6,16 @@ from typing import Dict, List, Any, Optional
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
 from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.filters import attach_verifiers, explain_long_gate
+from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
+from EMAMerged.src.indicators import atr as _atr
 from EMAMerged.src.data import (
-    fetch_latest_bars,      # dict[symbol] -> DataFrame (Option B dollar_vol computed before window trim)
-    alpaca_market_open,     # (base_url, key, secret) -> bool
-    cancel_all_orders,      # risk ops
-    close_all_positions,    # risk ops
+    fetch_latest_bars,       # dict[symbol] -> DataFrame (Option B dollar_vol)
+    alpaca_market_open,      # (base_url, key, secret) -> bool
+    cancel_all_orders,       # risk ops
+    close_all_positions,     # risk ops
+    submit_bracket_order,    # order placement
+    get_positions,           # to avoid adding to existing exposure
 )
-
-# If you later re-enable order placement / OCO, import here (kept unused to minimize churn)
-# from EMAMerged.src.oco import ensure_oco_for_long  # noqa: F401
 
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -68,6 +68,16 @@ def minutes_to_close_et(close_hm: tuple[int, int] = (16, 0)) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Sizing helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _cap_qty_by_notional(qty: int, price: float, max_notional: Optional[float]) -> int:
+    if notional := (None if max_notional in (None, 0, "0") else float(max_notional)):
+        max_by_notional = int(max(notional // max(price, 0.01), 0))
+        return max(0, min(qty, max_by_notional))
+    return max(0, qty)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> int:
@@ -80,15 +90,15 @@ def main() -> int:
 
     cfg = load_config(args.config)
 
-    # Timeframe + history lookback (keep your existing keys; intervals/periods optional)
+    # Timeframe + history lookback
     timeframe = cfg.get("timeframe", "15Min")
     history_days = int(cfg.get("history_days", 10))
     feed = cfg.get("feed", "iex")
     rth_only = bool(cfg.get("rth_only", True))
 
-    # Risk settings from config
-    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))  # block NEW entries within last N min
-    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))  # flatten N min before close
+    # Risk settings
+    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))                # block NEW entries near close
+    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))  # flatten before close
 
     # Broker + market status
     broker = _resolve_broker(cfg)
@@ -97,24 +107,22 @@ def main() -> int:
     # Tickers
     symbols = read_tickers(args.tickers)
 
-    # Session heuristic + heartbeat
+    # Session + heartbeat
     session = "AM" if new_york_now().hour < 12 else "PM"
-    hb = {"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()}
-    print(json.dumps(hb, separators=(",", ":"), ensure_ascii=False), flush=True)
+    print(json.dumps({"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
+                     separators=(",", ":"), ensure_ascii=False),
+          flush=True)
 
-    # Early exit if market closed and not forced
     if not market_open and not args.force_run:
         return 0
 
-    # Logger path (results/YYYYMMDD)
+    # Logger
     results_dir = cfg.get("results_dir", "results")
     os.makedirs(results_dir, exist_ok=True)
-    dstr = _utc_stamp("%Y%m%d")
-    log_path = os.path.join(results_dir, f"live_{dstr}.jsonl")
+    log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
 
-    # ── Risk Ops: Flatten before close (idempotent; safe to call repeatedly) ──
-    # Note: only run if market_open; dry-run respected.
+    # Risk Ops: Flatten window
     mins_to_close = minutes_to_close_et((16, 0))
     if flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close:
         if args.dry_run:
@@ -127,13 +135,11 @@ def main() -> int:
                 _ = close_all_positions(broker["base_url"], broker["key"], broker["secret"])
             except Exception as e:
                 print(f"[risk] ERROR during flatten: {e}", flush=True)
-        # After flatten window starts, we do not allow new entries
         entry_allowed = False
     else:
-        # Entry cutoff near close (only blocks NEW entries; still logs signals/gates)
         entry_allowed = (mins_to_close > entry_cutoff_min) if entry_cutoff_min > 0 else True
 
-    # Pull bars (Option B) — wire rolling params from config.filters (with defaults)
+    # Pull bars (Option B) — rolling params from config.filters
     fcfg = dict(cfg.get("filters", {}))
     bars_map = fetch_latest_bars(
         symbols,
@@ -152,24 +158,41 @@ def main() -> int:
         dollar_vol_min_periods=int(fcfg.get("dollar_vol_min_periods", 7)),
     )
 
-    # Iterate symbols → build signal & gate
+    # Current positions (avoid stacking)
+    pos_map = {}
+    try:
+        pos_map = get_positions(broker["base_url"], broker["key"], broker["secret"]) or {}
+    except Exception:
+        pos_map = {}
+
+    # Bracket configuration
+    br_cfg = dict(cfg.get("brackets", {}))
+    brackets_enabled = bool(br_cfg.get("enabled", True))
+    atr_mult_sl = float(br_cfg.get("atr_mult_sl", 1.2))
+    tp_r = float(br_cfg.get("take_profit_r", 1.8))
+
+    allow_shorts = bool(cfg.get("allow_shorts", False))  # current strategy is long-only; shorts ignored here
+    base_qty = int(cfg.get("qty", 1))
+    max_shares = int(cfg.get("max_shares_per_trade", base_qty))
+    max_notional = cfg.get("max_notional_per_trade", None)
+    max_notional = float(max_notional) if max_notional not in (None, "", "0") else None
+
+    # Iterate symbols
     for sym in symbols:
         df = bars_map.get(sym)
         if df is None or df.empty or len(df) < 3:
             continue
 
-        # Ensure indicators/verifiers present (computes EMA_fast/slow if missing; slope, RSI, ADX)
         df = attach_verifiers(df, cfg)
         last = df.iloc[-1]
 
-        # Quick cross flag (informational)
+        # Signal snapshot
         try:
             cross = 1 if float(last.get("ema_fast", 0.0)) > float(last.get("ema_slow", 0.0)) else 0
         except Exception:
             cross = 0
 
-        # Signal snapshot
-        row = {
+        sig_row = {
             "symbol": sym,
             "session": session,
             "cid": _build_cid(sym),
@@ -181,22 +204,73 @@ def main() -> int:
             "ema_slope_pct": float(last.get("ema_slope_pct", 0.0)),
             "rsi": float(last.get("rsi", 50.0)) if "rsi" in df.columns else None,
         }
-        row = {k: v for k, v in row.items() if v is not None}
-        log.signal(**row)
+        sig_row = {k: v for k, v in sig_row.items() if v is not None}
+        log.signal(**sig_row)
 
-        # Base gate decision + reasons (config-driven inside explain_long_gate)
+        # Base gate
         ok, reasons = explain_long_gate(last, cfg)
 
-        # Apply entry cutoff overlay (blocks NEW entries near close)
+        # Overlay: entry cutoff
         if not entry_allowed:
             reasons = list(reasons) + [f"entry_cutoff_min: {max(mins_to_close, 0)} min to close"]
             ok = False
 
-        # Log gate decision
-        log.gate(symbol=sym, session=session, cid=row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
+        # Avoid stacking: if already long, block new
+        if ok and sym in pos_map and float(pos_map[sym].get("qty", 0)) > 0:
+            reasons = list(reasons) + ["already in position"]
+            ok = False
 
-        # If you later re-enable order placement, handle ok==True here (and respect entry_allowed).
-        # Keeping intentionally out to minimize churn.
+        # Log gate
+        log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
+
+        # Place order if allowed
+        if not ok or not brackets_enabled:
+            continue
+
+        # Compute ATR-based bracket from recent data
+        atr_len = int(cfg.get("atr_length", 14))
+        try:
+            atr_series = _atr(df, period=atr_len)
+            atr_val = float(atr_series.iloc[-1])
+        except Exception:
+            atr_val = float("nan")
+
+        entry = float(last.get("close", 0.0))
+        if not (atr_val > 0 and entry > 0):
+            # Safety: if ATR missing or invalid, skip placing order
+            print(f"[order] skip {sym}: invalid ATR/entry (ATR={atr_val}, entry={entry})", flush=True)
+            continue
+
+        risk_per_share = atr_mult_sl * atr_val
+        stop_price = round(entry - risk_per_share, 2)
+        take_profit = round(entry + tp_r * risk_per_share, 2)
+        if not (stop_price < entry < take_profit):
+            print(f"[order] skip {sym}: bad TP/SL (entry={entry}, sl={stop_price}, tp={take_profit})", flush=True)
+            continue
+
+        # Size
+        qty = max(1, min(base_qty, max_shares))
+        qty = _cap_qty_by_notional(qty, entry, max_notional)
+        if qty < 1:
+            print(f"[order] skip {sym}: qty<1 after notional cap (entry={entry}, max_notional={max_notional})", flush=True)
+            continue
+
+        if args.dry_run:
+            print(f'[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} '
+                  f'sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})', flush=True)
+        else:
+            try:
+                resp = submit_bracket_order(
+                    broker["base_url"], broker["key"], broker["secret"],
+                    symbol=sym, qty=qty, side="buy",
+                    limit_price=None,  # market entry
+                    take_profit_price=take_profit,
+                    stop_loss_price=stop_price,
+                    tif="day",
+                )
+                print(f"[order] BRACKET submitted for {sym}: {json.dumps(resp)[:300]}", flush=True)
+            except Exception as e:
+                print(f"[order] ERROR submitting bracket for {sym}: {e}", flush=True)
 
     try:
         log.close()
