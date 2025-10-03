@@ -41,7 +41,7 @@ def _build_cid(symbol: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def _resolve_broker(cfg: Dict) -> Dict[str, str]:
     bk = dict(cfg.get("broker", {}))
-    base_url = os.getenv("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))
+    base_url = os.getenv("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))  # noqa: E501
 
     # Primary env names
     key_id = os.getenv("APCA_API_KEY_ID", bk.get("key") or "")
@@ -97,8 +97,8 @@ def main() -> int:
     rth_only = bool(cfg.get("rth_only", True))
 
     # Risk settings
-    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))                # block NEW entries near close
-    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))  # flatten before close
+    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))                     # block NEW entries near close
+    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0)) # flatten before close
 
     # Broker + market status
     broker = _resolve_broker(cfg)
@@ -109,9 +109,14 @@ def main() -> int:
 
     # Session + heartbeat
     session = "AM" if new_york_now().hour < 12 else "PM"
-    print(json.dumps({"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
-                     separators=(",", ":"), ensure_ascii=False),
-          flush=True)
+    print(
+        json.dumps(
+            {"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
     if not market_open and not args.force_run:
         return 0
@@ -122,22 +127,31 @@ def main() -> int:
     log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
 
-    # Risk Ops: Flatten window
+    # ── Risk Ops: Flatten window + entry cutoff computation (keep separate reasons)
     mins_to_close = minutes_to_close_et((16, 0))
-    if flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close:
+    mtc = max(mins_to_close, 0)
+
+    in_flatten_window = flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close
+    in_cutoff_window = (entry_cutoff_min > 0) and (mins_to_close <= entry_cutoff_min)
+
+    # If inside flatten window: perform risk ops once up front
+    if in_flatten_window:
         if args.dry_run:
-            print(f'[risk] DRY-RUN: would FLATTEN (cancel orders & close positions) with {mins_to_close} min to close', flush=True)
+            print(
+                f"[risk] DRY-RUN: would FLATTEN (cancel orders & close positions) with {mtc} min to close",
+                flush=True,
+            )
         else:
             try:
-                print(f'[risk] FLATTEN: canceling all orders (mins_to_close={mins_to_close})', flush=True)
+                print(f"[risk] FLATTEN: canceling all orders (mins_to_close={mtc})", flush=True)
                 _ = cancel_all_orders(broker["base_url"], broker["key"], broker["secret"])
-                print(f'[risk] FLATTEN: closing all positions', flush=True)
+                print(f"[risk] FLATTEN: closing all positions", flush=True)
                 _ = close_all_positions(broker["base_url"], broker["key"], broker["secret"])
             except Exception as e:
                 print(f"[risk] ERROR during flatten: {e}", flush=True)
-        entry_allowed = False
-    else:
-        entry_allowed = (mins_to_close > entry_cutoff_min) if entry_cutoff_min > 0 else True
+
+    # Entry is allowed only if NOT in flatten window and NOT in cutoff window
+    entry_allowed = not (in_flatten_window or in_cutoff_window)
 
     # Pull bars (Option B) — rolling params from config.filters
     fcfg = dict(cfg.get("filters", {}))
@@ -159,7 +173,7 @@ def main() -> int:
     )
 
     # Current positions (avoid stacking)
-    pos_map = {}
+    pos_map: Dict[str, Dict[str, Any]] = {}
     try:
         pos_map = get_positions(broker["base_url"], broker["key"], broker["secret"]) or {}
     except Exception:
@@ -210,9 +224,13 @@ def main() -> int:
         # Base gate
         ok, reasons = explain_long_gate(last, cfg)
 
-        # Overlay: entry cutoff
-        if not entry_allowed:
-            reasons = list(reasons) + [f"entry_cutoff_min: {max(mins_to_close, 0)} min to close"]
+        # Overlay: session close guards (use precise reasons)
+        #  - Only add a reason if we are actually blocking for that specific rule
+        if in_flatten_window and ok:
+            reasons = list(reasons) + [f"flatten_minutes_before_close: {mtc} min to close <= {flatten_min_before_close}"]
+            ok = False
+        elif in_cutoff_window and ok:
+            reasons = list(reasons) + [f"entry_cutoff_min: {mtc} min to close <= {entry_cutoff_min}"]
             ok = False
 
         # Avoid stacking: if already long, block new
@@ -221,7 +239,13 @@ def main() -> int:
             ok = False
 
         # Log gate
-        log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
+        log.gate(
+            symbol=sym,
+            session=session,
+            cid=sig_row["cid"],
+            decision=("ALLOW" if ok else "BLOCK"),
+            reasons=reasons,
+        )
 
         # Place order if allowed
         if not ok or not brackets_enabled:
@@ -255,13 +279,20 @@ def main() -> int:
             continue
 
         if args.dry_run:
-            print(f'[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} '
-                  f'sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})', flush=True)
+            print(
+                f"[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} "
+                f"sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})",
+                flush=True,
+            )
         else:
             try:
                 resp = submit_bracket_order(
-                    broker["base_url"], broker["key"], broker["secret"],
-                    symbol=sym, qty=qty, side="buy",
+                    broker["base_url"],
+                    broker["key"],
+                    broker["secret"],
+                    symbol=sym,
+                    qty=qty,
+                    side="buy",
                     limit_price=None,  # market entry
                     take_profit_price=take_profit,
                     stop_loss_price=stop_price,
