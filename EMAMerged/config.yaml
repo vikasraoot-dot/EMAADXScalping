@@ -77,6 +77,9 @@ filters:
   rsi_min: 50                # reference rsi_long_min
   rsi_max: 72                # reference rsi_long_max
   slope_threshold_pct: 0.0010  # require EMA_fast slope ≥ +0.08% per bar
+  dollar_vol_window: 20
+  dollar_vol_min_periods: 7
+  # min_dollar_vol: 5_000_000   # (optional gate; leave commented to skip gating)
 
   # Optional extras (leave commented if not needed):
   # min_price: 5.0
