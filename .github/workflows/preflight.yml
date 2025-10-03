@@ -93,12 +93,12 @@ jobs:
           '@
           $py | & "$env:PYTHON_EXE" -
 
-      - name: Repo sanity & UTC deprecation check
+      - name: Repo sanity and UTC deprecation check
         shell: powershell
         run: |
           chcp 65001 > $null
           $py = @'
-          import os, sys, json, re
+          import os, sys, json
           from pathlib import Path
 
           root = Path.cwd()
@@ -136,7 +136,7 @@ jobs:
           '@
           $py | & "$env:PYTHON_EXE" -
 
-      - name: Unit — indicators & gate logic (synthetic)
+      - name: Unit - indicators and gate logic (synthetic)
         shell: powershell
         run: |
           chcp 65001 > $null
@@ -181,21 +181,21 @@ jobs:
           '@
           $py | & "$env:PYTHON_EXE" -
 
-          - name: Live loop — DRY-RUN flatten path should trigger (no orders)
-          shell: powershell
-          env:
+      - name: Live loop - DRY-RUN flatten path should trigger (no orders)
+        shell: powershell
+        env:
           APCA_BASE_URL: https://paper-api.alpaca.markets
           APCA_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
           PYTHONUNBUFFERED: "1"
-          run: |
+        run: |
           chcp 65001 > $null
 
           $cfgIn  = "EMAMerged\config.yaml"
           $cfgOut = "EMAMerged\config.preflight.flatten.yaml"
           $helper = "write_flatten_cfg.py"
 
-          # Write the helper without here-strings (no terminator issues)
+          # Write helper without here-strings (no fragile terminators)
           $lines = @(
             "import sys, yaml",
             "src, dst = sys.argv[1], sys.argv[2]",
@@ -215,9 +215,5 @@ jobs:
 
           Remove-Item $helper -Force
 
-          # Run the live loop in DRY-RUN (should print a flatten warning)
-          & "$env:PYTHON_EXE" -X utf8 -u EMAMerged\scripts\live_paper_loop.py `
-            --config $cfgOut `
-            --tickers EMAMerged\tickers.txt `
-            --dry-run 1 `
-            --force-run 1
+          # Run the live loop in DRY-RUN (single line to avoid backtick issues)
+          & "$env:PYTHON_EXE" -X utf8 -u EMAMerged\scripts\live_paper_loop.py --config $cfgOut --tickers EMAMerged\tickers.txt --dry-run 1 --force-run 1
