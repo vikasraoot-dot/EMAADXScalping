@@ -82,9 +82,9 @@ jobs:
           Remove-Item $file -Force
 
             - name: Repo sanity and UTC deprecation check
-        shell: powershell
-        run: |
-          chcp 65001 > $null
+            shell: powershell
+            run: |
+                chcp 65001 > $null
 
           $file = "repo_sanity.py"
           $lines = @(
