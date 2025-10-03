@@ -18,22 +18,19 @@ def _req_with_retry(method: str, url: str, headers: dict, timeout: int = 20,
     while True:
         try:
             r = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
-            # Retry on throttle/server errors
             if r.status_code in RETRY_STATUS:
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
             return r
-        except Exception as e:
+        except Exception:
             attempt += 1
             if attempt > max_retries:
                 raise
-            sleep = backoff_base * (2 ** (attempt - 1))
-            time.sleep(sleep)
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
 
 def _headers(key: str, secret: str) -> dict:
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
 def _now_utc() -> dt.datetime:
-    # timezone-aware UTC (no utcnow() deprecation)
     return dt.datetime.now(tz=dt.timezone.utc)
 
 def alpaca_market_open(base_url: str, key: str, secret: str) -> bool:
@@ -58,26 +55,19 @@ def get_alpaca_bars(
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
     *,
-    # Backward-compatible convenience args (used by your backtester)
     days: int | None = None,
     history_days: int | None = None,
     feed: str = "iex",
     limit: int = 500,
     adjustment: str = "raw",
-    **_ignore: Any,  # safely swallow any unknown kwargs from older callers
+    **_ignore: Any,
 ) -> pd.DataFrame:
-    """
-    Fetch bars from Alpaca v2 data API.
-    timeframe: e.g. "1Min", "5Min", "15Min", "1Hour", "1Day"
-    """
-    # Build date range if only history_days/days provided
     if end is None:
         end = _now_utc()
     if start is None:
         hd = history_days if history_days is not None else (days if days is not None else 5)
         start = end - pd.Timedelta(days=int(hd))
 
-    # Data API v2 endpoint
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     params = {
         "timeframe": timeframe,
@@ -93,7 +83,6 @@ def get_alpaca_bars(
     if not bars:
         return pd.DataFrame()
     df = pd.DataFrame(bars)
-    # Normalize schema
     df["t"] = pd.to_datetime(df["t"], utc=True)
     df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     df = df.set_index("time").sort_index()
@@ -130,11 +119,10 @@ def drop_unclosed_last_bar(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     last = df.index[-1].tz_convert("UTC")
     now  = _now_utc()
     mins = _tf_minutes(timeframe)
-    # only drop if bar is truly still in-progress for this timeframe
     return df.iloc[:-1] if (now - last) < pd.Timedelta(minutes=mins) else df
 
 # ------------------------
-# Orders / Positions helpers
+# Orders / Positions helpers (unchanged)
 # ------------------------
 def get_positions(base_url: str, key: str, secret: str) -> Dict[str, Dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/v2/positions"
@@ -173,7 +161,6 @@ def submit_bracket_order(base_url: str, key: str, secret: str, symbol: str, qty:
         "take_profit": {"limit_price": round(float(take_profit_price), 2)},
         "stop_loss": {"stop_price": round(float(stop_loss_price), 2)},
     }
-    # Remove None fields cleanly
     payload = {k: v for k, v in payload.items() if v is not None}
     r = _req_with_retry("POST", url, headers=_headers(key, secret), timeout=20, json=payload)
     return r.json() if r.text else {}
@@ -211,7 +198,7 @@ def fetch_latest_bars(
     timeframe: str = "15Min",
     history_days: int = 30,
     feed: str = "iex",
-    # RTH controls (align with your config defaults)
+    # RTH controls
     rth_only: bool = True,
     tz_name: str = "US/Eastern",
     rth_start: str = "09:30",
@@ -221,22 +208,14 @@ def fetch_latest_bars(
     bar_limit: int = 10000,
     key: Optional[str] = None,
     secret: Optional[str] = None,
-    # Dollar-volume rolling config (Option B: compute BEFORE window trimming)
+    # Rolling config (wired from config via caller)
     dollar_vol_window: int = 20,
     dollar_vol_min_periods: int = 7,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch recent bars per symbol and return a dict[symbol]->DataFrame.
-
-    Option B: compute `dollar_vol_avg` on the full RTH slice BEFORE trimming
-    to `allowed_windows`, so the rolling has enough context from prior days.
-
-    Notes:
-      - We still drop the still-forming last bar to avoid lookahead.
-      - If rth_only is False, we compute dollar_vol_avg on the full df.
-      - Gating happens elsewhere; this function only prepares data.
+    Returns dict[symbol]->DataFrame. Computes `dollar_vol_avg` on the full RTH
+    slice BEFORE any allowed_windows trimming for stability from the first bar.
     """
-    # Resolve API creds from args or environment
     key = key or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY", "")
     secret = secret or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET", "")
 
@@ -255,16 +234,13 @@ def fetch_latest_bars(
             out[sym] = df
             continue
 
-        # Drop any unclosed/partial last bar for the given timeframe
+        # Avoid lookahead
         df = drop_unclosed_last_bar(df, timeframe)
 
-        # Create the RTH slice first (WITHOUT allowed_windows) for stable rolling math
-        if rth_only:
-            rth_df = filter_rth(df, tz_name=tz_name, rth_start=rth_start, rth_end=rth_end, allowed_windows=None)
-        else:
-            rth_df = df
+        # Build RTH slice WITHOUT windows
+        rth_df = filter_rth(df, tz_name=tz_name, rth_start=rth_start, rth_end=rth_end, allowed_windows=None) if rth_only else df
 
-        # Compute rolling dollar volume on the full RTH slice
+        # Rolling dollar volume on full RTH slice
         if not rth_df.empty and {"close", "volume"}.issubset(rth_df.columns):
             dv = (rth_df["close"].astype(float) * rth_df["volume"].astype(float)).rolling(
                 int(dollar_vol_window),
@@ -274,18 +250,11 @@ def fetch_latest_bars(
         else:
             rth_df["dollar_vol_avg"] = 0.0
 
-        # Now optionally trim to allowed_windows while preserving computed columns
-        if rth_only and allowed_windows:
-            final_df = filter_rth(
-                rth_df,
-                tz_name=tz_name,
-                rth_start=rth_start,
-                rth_end=rth_end,
-                allowed_windows=allowed_windows,
-            )
-        else:
-            final_df = rth_df
-
+        # Now optionally trim to allowed_windows (preserves computed columns)
+        final_df = (
+            filter_rth(rth_df, tz_name=tz_name, rth_start=rth_start, rth_end=rth_end, allowed_windows=allowed_windows)
+            if (rth_only and allowed_windows) else rth_df
+        )
         out[sym] = final_df
 
     return out
