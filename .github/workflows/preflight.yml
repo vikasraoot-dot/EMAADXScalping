@@ -81,7 +81,7 @@ jobs:
           & "$env:PYTHON_EXE" $file
           Remove-Item $file -Force
 
-      - name: Repo sanity and UTC deprecation check
+            - name: Repo sanity and UTC deprecation check
         shell: powershell
         run: |
           chcp 65001 > $null
@@ -91,6 +91,7 @@ jobs:
             'import json',
             'from pathlib import Path',
             'root = Path.cwd()',
+            'me = Path(__file__).resolve()',
             'def read(p):',
             '    try: return p.read_text(encoding="utf-8", errors="ignore")',
             '    except: return ""',
@@ -106,7 +107,13 @@ jobs:
             '    raise SystemExit("Missing required files: " + ", ".join(missing))',
             'hits = []',
             'for p in root.rglob("*.py"):',
-            '    if "utcnow()" in read(p): hits.append(str(p))',
+            '    try:',
+            '        if p.resolve() == me:',
+            '            continue  # skip this script itself',
+            '    except Exception:',
+            '        pass',
+            '    if "utcnow()" in read(p):',
+            '        hits.append(str(p))',
             'if hits:',
             '    raise SystemExit("utcnow() still present in: " + ", ".join(hits))',
             'orphan = root / "EMAMerged/src/trader_logger.py"',
