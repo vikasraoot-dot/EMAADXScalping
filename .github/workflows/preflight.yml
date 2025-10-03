@@ -81,10 +81,10 @@ jobs:
           & "$env:PYTHON_EXE" $file
           Remove-Item $file -Force
 
-            - name: Repo sanity and UTC deprecation check
-            shell: powershell
-            run: |
-                chcp 65001 > $null
+      - name: Repo sanity and UTC deprecation check
+        shell: powershell
+        run: |
+          chcp 65001 > $null
 
           $file = "repo_sanity.py"
           $lines = @(
@@ -109,7 +109,7 @@ jobs:
             'for p in root.rglob("*.py"):',
             '    try:',
             '        if p.resolve() == me:',
-            '            continue  # skip this script itself',
+            '            continue',
             '    except Exception:',
             '        pass',
             '    if "utcnow()" in read(p):',
@@ -198,5 +198,4 @@ jobs:
           if (-not (Test-Path $cfgOut)) { throw "Failed to write $cfgOut" }
           Remove-Item $helper -Force
 
-          # Run the live loop as a module (ensures EMAMerged imports resolve)
           & "$env:PYTHON_EXE" -X utf8 -m EMAMerged.scripts.live_paper_loop --config $cfgOut --tickers EMAMerged\tickers.txt --dry-run 1 --force-run 1
