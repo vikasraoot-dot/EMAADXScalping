@@ -68,7 +68,7 @@ def _fb_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     rma_loss = loss.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
     rs = rma_gain / rma_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill").fillna(50.0)
+    return rsi.bfill().fillna(50.0)
 
 def _fb_wilder_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
