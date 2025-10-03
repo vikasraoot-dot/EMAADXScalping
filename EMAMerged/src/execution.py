@@ -18,7 +18,8 @@ def _headers() -> Dict[str,str]:
     }
 
 def _now_iso() -> str:
-    return dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    # timezone-aware replacement; avoids deprecated utcnow()
+    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _req(method: str, path: str, ok=(200,201), **kw):
     url = f"{ALPACA_BASE}{path}"
