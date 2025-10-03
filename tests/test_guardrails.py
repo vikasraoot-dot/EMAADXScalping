@@ -12,12 +12,10 @@ import pytest
 #
 
 def _utc_now():
-    """Return a UTC-aware Timestamp, robust across pandas versions, without using utcnow()."""
-    # Prefer explicit tz-aware now to avoid deprecation warnings and preflight grep failures.
+    """Return a UTC-aware Timestamp, robust across pandas versions, without deprecated calls."""
     try:
         return pd.Timestamp.now(tz="UTC")
     except Exception:
-        # Absolute fallback: construct from Python datetime
         from datetime import datetime, timezone
         return pd.Timestamp(datetime.now(timezone.utc))
 
