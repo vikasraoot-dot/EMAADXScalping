@@ -12,16 +12,14 @@ import pytest
 #
 
 def _utc_now():
-    """Return a UTC-aware Timestamp, robust across pandas versions."""
-    ts = pd.Timestamp.utcnow()
-    # Some pandas versions return tz-aware here; others return naive.
-    if getattr(ts, "tzinfo", None) is None:
-        return ts.tz_localize("UTC")
+    """Return a UTC-aware Timestamp, robust across pandas versions, without using utcnow()."""
+    # Prefer explicit tz-aware now to avoid deprecation warnings and preflight grep failures.
     try:
-        return ts.tz_convert("UTC")
-    except Exception:
-        # Fallback: ensure UTC tz
         return pd.Timestamp.now(tz="UTC")
+    except Exception:
+        # Absolute fallback: construct from Python datetime
+        from datetime import datetime, timezone
+        return pd.Timestamp(datetime.now(timezone.utc))
 
 def _make_bars(periods=3, tf_minutes=15, close=100.0, atr=0.8):
     """Small 15m bar DataFrame with ATR column present."""
