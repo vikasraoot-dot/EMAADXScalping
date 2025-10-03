@@ -181,34 +181,33 @@ jobs:
           '@
           $py | & "$env:PYTHON_EXE" -
 
-      - name: Live loop — DRY-RUN flatten path should trigger (no orders)
-        shell: powershell
-        env:
+          - name: Live loop — DRY-RUN flatten path should trigger (no orders)
+          shell: powershell
+          env:
           APCA_BASE_URL: https://paper-api.alpaca.markets
           APCA_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           PYTHONUNBUFFERED: "1"
-        run: |
+          run: |
           chcp 65001 > $null
 
           $cfgIn  = "EMAMerged\config.yaml"
           $cfgOut = "EMAMerged\config.preflight.flatten.yaml"
-
-          # Write a tiny helper script to avoid fragile -c quoting
-          $script = @"
-                  import sys, yaml
-                  src, dst = sys.argv[1], sys.argv[2]
-                  with open(src, 'r', encoding='utf-8') as f:
-                      cfg = yaml.safe_load(f) or {}
-                  cfg['flatten_minutes_before_close'] = 10000
-                  cfg['entry_cutoff_min'] = 0
-                  with open(dst, 'w', encoding='utf-8') as f:
-                      yaml.safe_dump(cfg, f, sort_keys=False)
-                  print(dst)
-                  "@
-
           $helper = "write_flatten_cfg.py"
-          Set-Content -LiteralPath $helper -Value $script -Encoding UTF8
+
+          # Write the helper without here-strings (no terminator issues)
+          $lines = @(
+            "import sys, yaml",
+            "src, dst = sys.argv[1], sys.argv[2]",
+            "with open(src, 'r', encoding='utf-8') as f:",
+            "    cfg = yaml.safe_load(f) or {}",
+            "cfg['flatten_minutes_before_close'] = 10000",
+            "cfg['entry_cutoff_min'] = 0",
+            "with open(dst, 'w', encoding='utf-8') as f:",
+            "    yaml.safe_dump(cfg, f, sort_keys=False)",
+            "print(dst)"
+          )
+          [System.IO.File]::WriteAllLines($helper, $lines)
 
           $outPath = & "$env:PYTHON_EXE" $helper $cfgIn $cfgOut
           Write-Host "Wrote: $outPath"
