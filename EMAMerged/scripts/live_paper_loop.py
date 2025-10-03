@@ -14,14 +14,14 @@ from EMAMerged.src.data import (
     cancel_all_orders,       # risk ops
     close_all_positions,     # risk ops
     submit_bracket_order,    # order placement
-    get_positions,           # to avoid adding to existing exposure
+    get_positions,           # avoid stacking
 )
 
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UTC helpers (no utcnow() deprecation warnings)
+# UTC helpers (tz-aware)
 # ──────────────────────────────────────────────────────────────────────────────
 def now_iso_utc() -> str:
     return dt.datetime.now(dt.UTC).strftime(ISO_UTC)
@@ -32,7 +32,7 @@ def _utc_stamp(fmt: str) -> str:
 
 
 def _build_cid(symbol: str) -> str:
-    # Preserve prior format, just timezone-aware now
+    # Preserve prior format with tz-aware now
     return f"EMA_{symbol}_{_utc_stamp('%Y%m%d_%H%M%S')}"
 
 
