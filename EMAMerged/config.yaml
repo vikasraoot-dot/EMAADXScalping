@@ -10,6 +10,7 @@ periods:
 # Backward-compat (kept; will be overridden by intervals/periods above if set)
 timeframe: "15Min"
 history_days: 30
+min_minutes_after_open_for_entry: 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SESSION / DATA
