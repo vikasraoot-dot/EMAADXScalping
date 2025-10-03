@@ -36,12 +36,11 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           chcp 65001 > $null
-
           $file = "preflight_auth_probe.py"
           $lines = @(
             'import os, sys, json, datetime as dt, requests',
             'from datetime import timezone',
-            'def log(obj): print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))',
+            'def log(obj): print(json.dumps(obj, ensure_ascii=False))',
             'base = (os.getenv("APCA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")',
             'key  = os.getenv("APCA_API_KEY_ID")',
             'sec  = os.getenv("APCA_API_SECRET_KEY")',
@@ -85,7 +84,6 @@ jobs:
         shell: powershell
         run: |
           chcp 65001 > $null
-
           $file = "repo_sanity.py"
           $lines = @(
             'import json',
@@ -125,46 +123,45 @@ jobs:
           & "$env:PYTHON_EXE" $file
           Remove-Item $file -Force
 
-            - name: Unit - indicators and gate logic (synthetic)
-            shell: powershell
-            run: |
-              chcp 65001 > $null
-
-              $file = "unit_indicators.py"
-              $lines = @(
-                'import json',
-                'import numpy as np, pandas as pd',
-                'from datetime import datetime, timezone, timedelta',
-                'from EMAMerged.src.filters import attach_verifiers, long_ok, explain_long_gate',
-                'idx = pd.date_range(datetime.now(timezone.utc) - timedelta(hours=8), periods=64, freq="15min", tz="UTC")',
-                'close_up = pd.Series(np.linspace(100, 104, len(idx)) + np.sin(np.linspace(0, 6.28, len(idx)))*0.2, index=idx)',
-                'vol = pd.Series(np.random.randint(100000, 200000, len(idx)), index=idx)',
-                'df = pd.DataFrame({"close": close_up, "open": close_up, "high": close_up+0.1, "low": close_up-0.1, "volume": vol})',
-                'cfg = {',
-                '  "ema_fast": 9, "ema_slow": 21, "rsi_length": 14,',
-                '  "filters": {',
-                '    "require_fast_above_slow": True,',
-                '    "adx_threshold": 0,',
-                '    "rsi_min": 0, "rsi_max": 100,',
-                '    "slope_threshold_pct": 0.0001',
-                '  }',
-                '}',
-                'df = attach_verifiers(df, cfg)',
-                'last = df.iloc[-1]',
-                'ok1 = long_ok(last, cfg)',
-                'assert ok1, "Expected True long_ok on uptrend; reasons=" + str(explain_long_gate(last, cfg))',
-                'assert float(last["ema_slope_pct"]) > 0, "ema_slope_pct should be > 0 on uptrend"',
-                'close_dn = pd.Series(np.linspace(104, 100, len(idx)), index=idx)',
-                'df2 = pd.DataFrame({"close": close_dn, "open": close_dn, "high": close_dn+0.1, "low": close_dn-0.1, "volume": vol})',
-                'df2 = attach_verifiers(df2, cfg)',
-                'last2 = df2.iloc[-1]',
-                'ok2, reasons2 = explain_long_gate(last2, cfg)',
-                'assert (not ok2) and any("ema_fast" in r for r in reasons2), "Expected fast<=slow block; reasons=" + str(reasons2)',
-                'print(json.dumps({"type":"UNIT_INDICATORS","ok_uptrend":bool(ok1),"blocked_downtrend":bool(not ok2)}))'
-              )
-              [System.IO.File]::WriteAllLines($file, $lines)
-              & "$env:PYTHON_EXE" $file
-              Remove-Item $file -Force
+      - name: Unit - indicators and gate logic (synthetic)
+        shell: powershell
+        run: |
+          chcp 65001 > $null
+          $file = "unit_indicators.py"
+          $lines = @(
+            'import json',
+            'import numpy as np, pandas as pd',
+            'from datetime import datetime, timezone, timedelta',
+            'from EMAMerged.src.filters import attach_verifiers, long_ok, explain_long_gate',
+            'idx = pd.date_range(datetime.now(timezone.utc) - timedelta(hours=8), periods=64, freq="15min", tz="UTC")',
+            'close_up = pd.Series(np.linspace(100, 104, len(idx)) + np.sin(np.linspace(0, 6.28, len(idx)))*0.2, index=idx)',
+            'vol = pd.Series(np.random.randint(100000, 200000, len(idx)), index=idx)',
+            'df = pd.DataFrame({"close": close_up, "open": close_up, "high": close_up+0.1, "low": close_up-0.1, "volume": vol})',
+            'cfg = {',
+            '  "ema_fast": 9, "ema_slow": 21, "rsi_length": 14,',
+            '  "filters": {',
+            '    "require_fast_above_slow": True,',
+            '    "adx_threshold": 0,',
+            '    "rsi_min": 0, "rsi_max": 100,',
+            '    "slope_threshold_pct": 0.0001',
+            '  }',
+            '}',
+            'df = attach_verifiers(df, cfg)',
+            'last = df.iloc[-1]',
+            'ok1 = long_ok(last, cfg)',
+            'assert ok1, "Expected True long_ok on uptrend; reasons=" + str(explain_long_gate(last, cfg))',
+            'assert float(last["ema_slope_pct"]) > 0, "ema_slope_pct should be > 0 on uptrend"',
+            'close_dn = pd.Series(np.linspace(104, 100, len(idx)), index=idx)',
+            'df2 = pd.DataFrame({"close": close_dn, "open": close_dn, "high": close_dn+0.1, "low": close_dn-0.1, "volume": vol})',
+            'df2 = attach_verifiers(df2, cfg)',
+            'last2 = df2.iloc[-1]',
+            'ok2, reasons2 = explain_long_gate(last2, cfg)',
+            'assert (not ok2) and any("ema_fast" in r for r in reasons2), "Expected fast<=slow block; reasons=" + str(reasons2)',
+            'print(json.dumps({"type":"UNIT_INDICATORS","ok_uptrend":bool(ok1),"blocked_downtrend":bool(not ok2)}))'
+          )
+          [System.IO.File]::WriteAllLines($file, $lines)
+          & "$env:PYTHON_EXE" $file
+          Remove-Item $file -Force
 
       - name: Live loop - DRY-RUN flatten path should trigger (no orders)
         shell: powershell
@@ -175,11 +172,9 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           chcp 65001 > $null
-
           $cfgIn  = "EMAMerged\config.yaml"
           $cfgOut = "EMAMerged\config.preflight.flatten.yaml"
           $helper = "write_flatten_cfg.py"
-
           $lines = @(
             'import sys, yaml',
             'src, dst = sys.argv[1], sys.argv[2]',
@@ -192,10 +187,8 @@ jobs:
             'print(dst)'
           )
           [System.IO.File]::WriteAllLines($helper, $lines)
-
           $outPath = & "$env:PYTHON_EXE" $helper $cfgIn $cfgOut
           Write-Host "Wrote: $outPath"
           if (-not (Test-Path $cfgOut)) { throw "Failed to write $cfgOut" }
           Remove-Item $helper -Force
-
           & "$env:PYTHON_EXE" -X utf8 -m EMAMerged.scripts.live_paper_loop --config $cfgOut --tickers EMAMerged\tickers.txt --dry-run 1 --force-run 1
