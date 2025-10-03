@@ -80,6 +80,7 @@ filters:
   dollar_vol_window: 20
   dollar_vol_min_periods: 7
   # min_dollar_vol: 5_000_000   # (optional gate; leave commented to skip gating)
+  require_fast_above_slow: true
 
   # Optional extras (leave commented if not needed):
   # min_price: 5.0
