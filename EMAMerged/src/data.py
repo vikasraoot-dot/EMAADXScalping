@@ -246,7 +246,7 @@ def fetch_latest_bars(
                 int(dollar_vol_window),
                 min_periods=int(dollar_vol_min_periods),
             ).mean()
-            rth_df["dollar_vol_avg"] = dv.fillna(method="ffill").fillna(0.0)
+            rth_df["dollar_vol_avg"] = dv.ffill().fillna(0.0)
         else:
             rth_df["dollar_vol_avg"] = 0.0
 
