@@ -8,11 +8,14 @@ from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.filters import attach_verifiers, explain_long_gate
 from EMAMerged.src.data import (
-    fetch_latest_bars,     # dict[symbol] -> DataFrame
-    alpaca_market_open,    # (base_url, key, secret) -> bool
+    fetch_latest_bars,      # dict[symbol] -> DataFrame (Option B dollar_vol computed before window trim)
+    alpaca_market_open,     # (base_url, key, secret) -> bool
+    cancel_all_orders,      # risk ops
+    close_all_positions,    # risk ops
 )
-# Imported for future order placement (left unused here to minimize churn)
-from EMAMerged.src.oco import ensure_oco_for_long  # noqa: F401
+
+# If you later re-enable order placement / OCO, import here (kept unused to minimize churn)
+# from EMAMerged.src.oco import ensure_oco_for_long  # noqa: F401
 
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -51,6 +54,20 @@ def _resolve_broker(cfg: Dict) -> Dict[str, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Time helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def minutes_to_close_et(close_hm: tuple[int, int] = (16, 0)) -> int:
+    """
+    Minutes from 'now' (New York time) until today's regular close (default 16:00 ET).
+    Negative if after close.
+    """
+    now_et = new_york_now()   # timezone-aware
+    close_et = now_et.replace(hour=close_hm[0], minute=close_hm[1], second=0, microsecond=0)
+    delta = close_et - now_et
+    return int(delta.total_seconds() // 60)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> int:
@@ -69,6 +86,10 @@ def main() -> int:
     feed = cfg.get("feed", "iex")
     rth_only = bool(cfg.get("rth_only", True))
 
+    # Risk settings from config
+    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))  # block NEW entries within last N min
+    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))  # flatten N min before close
+
     # Broker + market status
     broker = _resolve_broker(cfg)
     market_open = alpaca_market_open(broker["base_url"], broker["key"], broker["secret"])
@@ -81,6 +102,7 @@ def main() -> int:
     hb = {"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()}
     print(json.dumps(hb, separators=(",", ":"), ensure_ascii=False), flush=True)
 
+    # Early exit if market closed and not forced
     if not market_open and not args.force_run:
         return 0
 
@@ -91,7 +113,27 @@ def main() -> int:
     log_path = os.path.join(results_dir, f"live_{dstr}.jsonl")
     log = TradeLogger(log_path)
 
-    # Pull bars (Option B) — wire window/min_periods from config.filters (with defaults)
+    # ── Risk Ops: Flatten before close (idempotent; safe to call repeatedly) ──
+    # Note: only run if market_open; dry-run respected.
+    mins_to_close = minutes_to_close_et((16, 0))
+    if flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close:
+        if args.dry_run:
+            print(f'[risk] DRY-RUN: would FLATTEN (cancel orders & close positions) with {mins_to_close} min to close', flush=True)
+        else:
+            try:
+                print(f'[risk] FLATTEN: canceling all orders (mins_to_close={mins_to_close})', flush=True)
+                _ = cancel_all_orders(broker["base_url"], broker["key"], broker["secret"])
+                print(f'[risk] FLATTEN: closing all positions', flush=True)
+                _ = close_all_positions(broker["base_url"], broker["key"], broker["secret"])
+            except Exception as e:
+                print(f"[risk] ERROR during flatten: {e}", flush=True)
+        # After flatten window starts, we do not allow new entries
+        entry_allowed = False
+    else:
+        # Entry cutoff near close (only blocks NEW entries; still logs signals/gates)
+        entry_allowed = (mins_to_close > entry_cutoff_min) if entry_cutoff_min > 0 else True
+
+    # Pull bars (Option B) — wire rolling params from config.filters (with defaults)
     fcfg = dict(cfg.get("filters", {}))
     bars_map = fetch_latest_bars(
         symbols,
@@ -120,7 +162,7 @@ def main() -> int:
         df = attach_verifiers(df, cfg)
         last = df.iloc[-1]
 
-        # Quick cross flag (purely informational here)
+        # Quick cross flag (informational)
         try:
             cross = 1 if float(last.get("ema_fast", 0.0)) > float(last.get("ema_slow", 0.0)) else 0
         except Exception:
@@ -138,19 +180,23 @@ def main() -> int:
             "adx": float(last.get("adx", 0.0)),
             "ema_slope_pct": float(last.get("ema_slope_pct", 0.0)),
             "rsi": float(last.get("rsi", 50.0)) if "rsi" in df.columns else None,
-            # Note: dollar_vol_avg is computed upstream (data.py, Option B).
-            # We do not gate on it unless `min_dollar_vol` is set in config.filters.
         }
-        # Remove None for cleaner JSON
         row = {k: v for k, v in row.items() if v is not None}
         log.signal(**row)
 
-        # Gate decision + reasons (purely config-driven)
+        # Base gate decision + reasons (config-driven inside explain_long_gate)
         ok, reasons = explain_long_gate(last, cfg)
+
+        # Apply entry cutoff overlay (blocks NEW entries near close)
+        if not entry_allowed:
+            reasons = list(reasons) + [f"entry_cutoff_min: {max(mins_to_close, 0)} min to close"]
+            ok = False
+
+        # Log gate decision
         log.gate(symbol=sym, session=session, cid=row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
 
-        # If you later re-enable order placement, this is the branch to do it.
-        # Kept intentionally out to minimize churn per your request.
+        # If you later re-enable order placement, handle ok==True here (and respect entry_allowed).
+        # Keeping intentionally out to minimize churn.
 
     try:
         log.close()
