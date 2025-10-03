@@ -1,39 +1,58 @@
 # === EMAMerged/scripts/live_paper_loop.py ===
 from __future__ import annotations
-import os, sys, json, time, argparse
+import os, sys, json, argparse
 import datetime as dt
 from typing import Dict, List, Any, Optional
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
 from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
+from EMAMerged.src.filters import attach_verifiers, explain_long_gate
 from EMAMerged.src.data import (
-    fetch_latest_bars,     # expects (symbols, timeframe, history_days, feed) → dict[sym]->DataFrame
-    alpaca_market_open,    # (base_url, key, secret) → bool
+    fetch_latest_bars,     # dict[symbol] -> DataFrame
+    alpaca_market_open,    # (base_url, key, secret) -> bool
 )
-from EMAMerged.src.oco import ensure_oco_for_long
+# Imported for future order placement (left unused here to minimize churn)
+from EMAMerged.src.oco import ensure_oco_for_long  # noqa: F401
 
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 
-# ── UTC helpers (fix deprecation) ─────────────────────────────────────────────
-# Python 3.12+ deprecates datetime.utcnow(). Use timezone-aware UTC instead.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UTC helpers (no utcnow() deprecation warnings)
+# ──────────────────────────────────────────────────────────────────────────────
 def now_iso_utc() -> str:
     return dt.datetime.now(dt.UTC).strftime(ISO_UTC)
+
 
 def _utc_stamp(fmt: str) -> str:
     return dt.datetime.now(dt.UTC).strftime(fmt)
 
+
 def _build_cid(symbol: str) -> str:
-    # unchanged format, just timezone-aware
+    # Preserve prior format, just timezone-aware now
     return f"EMA_{symbol}_{_utc_stamp('%Y%m%d_%H%M%S')}"
 
-def _log_signal(log: TradeLogger, row: Dict[str, Any]) -> None:
-    log.signal(**row)
 
-def _log_gate(log: TradeLogger, decision: str, reasons: List[str], symbol: str, session: str, cid: str) -> None:
-    log.gate(symbol=symbol, session=session, cid=cid, decision=decision, reasons=reasons)
+# ──────────────────────────────────────────────────────────────────────────────
+# Broker creds resolution (env first, then config)
+# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_broker(cfg: Dict) -> Dict[str, str]:
+    bk = dict(cfg.get("broker", {}))
+    base_url = os.getenv("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))
 
-# ── main ─────────────────────────────────────────────────────────────────────
+    # Primary env names
+    key_id = os.getenv("APCA_API_KEY_ID", bk.get("key") or "")
+    secret = os.getenv("APCA_API_SECRET_KEY", bk.get("secret") or "")
+    # Back-compat aliases
+    key_id = os.getenv("ALPACA_KEY", key_id)
+    secret = os.getenv("ALPACA_SECRET", secret)
+
+    return {"base_url": base_url, "key": key_id, "secret": secret}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -44,37 +63,36 @@ def main() -> int:
 
     cfg = load_config(args.config)
 
+    # Timeframe + history lookback (keep your existing keys; intervals/periods optional)
     timeframe = cfg.get("timeframe", "15Min")
     history_days = int(cfg.get("history_days", 10))
     feed = cfg.get("feed", "iex")
     rth_only = bool(cfg.get("rth_only", True))
 
-    # broker creds
-    broker = dict(cfg.get("broker", {}))
-    key = broker.get("key") or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY", "")
-    secret = broker.get("secret") or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET", "")
-    base_url = broker.get("base_url", "https://paper-api.alpaca.markets")
+    # Broker + market status
+    broker = _resolve_broker(cfg)
+    market_open = alpaca_market_open(broker["base_url"], broker["key"], broker["secret"])
 
-    # tickers
+    # Tickers
     symbols = read_tickers(args.tickers)
 
-    # Heartbeat
+    # Session heuristic + heartbeat
     session = "AM" if new_york_now().hour < 12 else "PM"
-    market_open = alpaca_market_open(base_url, key, secret)
     hb = {"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()}
     print(json.dumps(hb, separators=(",", ":"), ensure_ascii=False), flush=True)
 
     if not market_open and not args.force_run:
         return 0
 
-    # Logger (date dir stamp also fixed to timezone-aware)
+    # Logger path (results/YYYYMMDD)
     results_dir = cfg.get("results_dir", "results")
-    dstr = _utc_stamp("%Y%m%d")
     os.makedirs(results_dir, exist_ok=True)
+    dstr = _utc_stamp("%Y%m%d")
     log_path = os.path.join(results_dir, f"live_{dstr}.jsonl")
     log = TradeLogger(log_path)
 
-    # Pull bars
+    # Pull bars (Option B) — wire window/min_periods from config.filters (with defaults)
+    fcfg = dict(cfg.get("filters", {}))
     bars_map = fetch_latest_bars(
         symbols,
         timeframe=timeframe,
@@ -84,31 +102,31 @@ def main() -> int:
         tz_name=cfg.get("timezone", "US/Eastern"),
         rth_start=cfg.get("rth_start", "09:30"),
         rth_end=cfg.get("rth_end", "15:55"),
-        allowed_windows=cfg.get("entry_windows"),   # ok if None
+        allowed_windows=cfg.get("entry_windows"),
         bar_limit=int(cfg.get("bar_limit", 10000)),
-        key=key,
-        secret=secret,
+        key=broker["key"],
+        secret=broker["secret"],
+        dollar_vol_window=int(fcfg.get("dollar_vol_window", 20)),
+        dollar_vol_min_periods=int(fcfg.get("dollar_vol_min_periods", 7)),
     )
 
-    # Iterate symbols
-    fcfg = dict(cfg.get("filters", {}))
+    # Iterate symbols → build signal & gate
     for sym in symbols:
         df = bars_map.get(sym)
         if df is None or df.empty or len(df) < 3:
             continue
 
-        # Ensure indicators & verifiers are present; this now also creates EMA cols & slope
+        # Ensure indicators/verifiers present (computes EMA_fast/slow if missing; slope, RSI, ADX)
         df = attach_verifiers(df, cfg)
-
         last = df.iloc[-1]
 
-        # Simple cross flag (uses EMA columns now present)
+        # Quick cross flag (purely informational here)
         try:
             cross = 1 if float(last.get("ema_fast", 0.0)) > float(last.get("ema_slow", 0.0)) else 0
         except Exception:
             cross = 0
 
-        # Build and log signal snapshot
+        # Signal snapshot
         row = {
             "symbol": sym,
             "session": session,
@@ -119,20 +137,21 @@ def main() -> int:
             "last_close": float(last.get("close", 0.0)),
             "adx": float(last.get("adx", 0.0)),
             "ema_slope_pct": float(last.get("ema_slope_pct", 0.0)),
+            "rsi": float(last.get("rsi", 50.0)) if "rsi" in df.columns else None,
+            # Note: dollar_vol_avg is computed upstream (data.py, Option B).
+            # We do not gate on it unless `min_dollar_vol` is set in config.filters.
         }
-        if "rsi" in df.columns:
-            row["rsi"] = float(last.get("rsi", 50.0))
+        # Remove None for cleaner JSON
+        row = {k: v for k, v in row.items() if v is not None}
+        log.signal(**row)
 
-        _log_signal(log, row)
-
-        # Gate decision (reasons visible via explain_long_gate)
+        # Gate decision + reasons (purely config-driven)
         ok, reasons = explain_long_gate(last, cfg)
-        _log_gate(log, "ALLOW" if ok else "BLOCK", reasons, sym, session, row["cid"])
+        log.gate(symbol=sym, session=session, cid=row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
 
-        # (Order placement & OCO stays as-is in your existing code base; keeping minimal churn.)
-        # If you want to place orders here, your existing execution code can be invoked as before.
+        # If you later re-enable order placement, this is the branch to do it.
+        # Kept intentionally out to minimize churn per your request.
 
-    # Clean exit
     try:
         log.close()
     except Exception:
