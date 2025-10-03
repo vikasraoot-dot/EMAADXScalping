@@ -102,7 +102,7 @@ jobs:
           from pathlib import Path
 
           root = Path.cwd()
-          def read(p): 
+          def read(p):
               try: return p.read_text(encoding="utf-8", errors="ignore")
               except: return ""
 
@@ -122,11 +122,9 @@ jobs:
               txt = read(p)
               if "utcnow()" in txt:
                   utc_hits.append(str(p))
-          # Fail if any utcnow() remains in our repo
           if utc_hits:
               raise SystemExit("utcnow() still present in: " + ", ".join(utc_hits))
 
-          # Ensure the old shim is gone
           orphan = root / "EMAMerged/src/trader_logger.py"
           print(json.dumps({
               "type":"REPO_SANITY",
@@ -183,7 +181,7 @@ jobs:
           '@
           $py | & "$env:PYTHON_EXE" -
 
-                - name: Live loop — DRY-RUN flatten path should trigger (no orders)
+      - name: Live loop — DRY-RUN flatten path should trigger (no orders)
         shell: powershell
         env:
           APCA_BASE_URL: https://paper-api.alpaca.markets
@@ -198,16 +196,16 @@ jobs:
 
           # Write a tiny helper script to avoid fragile -c quoting
           $script = @"
-import sys, yaml
-src, dst = sys.argv[1], sys.argv[2]
-with open(src, 'r', encoding='utf-8') as f:
-    cfg = yaml.safe_load(f) or {}
-cfg['flatten_minutes_before_close'] = 10000
-cfg['entry_cutoff_min'] = 0
-with open(dst, 'w', encoding='utf-8') as f:
-    yaml.safe_dump(cfg, f, sort_keys=False)
-print(dst)
-"@
+                  import sys, yaml
+                  src, dst = sys.argv[1], sys.argv[2]
+                  with open(src, 'r', encoding='utf-8') as f:
+                      cfg = yaml.safe_load(f) or {}
+                  cfg['flatten_minutes_before_close'] = 10000
+                  cfg['entry_cutoff_min'] = 0
+                  with open(dst, 'w', encoding='utf-8') as f:
+                      yaml.safe_dump(cfg, f, sort_keys=False)
+                  print(dst)
+                  "@
 
           $helper = "write_flatten_cfg.py"
           Set-Content -LiteralPath $helper -Value $script -Encoding UTF8
