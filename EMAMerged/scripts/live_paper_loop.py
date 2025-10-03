@@ -171,7 +171,7 @@ def main() -> int:
     atr_mult_sl = float(br_cfg.get("atr_mult_sl", 1.2))
     tp_r = float(br_cfg.get("take_profit_r", 1.8))
 
-    allow_shorts = bool(cfg.get("allow_shorts", False))  # current strategy is long-only; shorts ignored here
+    allow_shorts = bool(cfg.get("allow_shorts", False))  # long-only here
     base_qty = int(cfg.get("qty", 1))
     max_shares = int(cfg.get("max_shares_per_trade", base_qty))
     max_notional = cfg.get("max_notional_per_trade", None)
@@ -237,7 +237,6 @@ def main() -> int:
 
         entry = float(last.get("close", 0.0))
         if not (atr_val > 0 and entry > 0):
-            # Safety: if ATR missing or invalid, skip placing order
             print(f"[order] skip {sym}: invalid ATR/entry (ATR={atr_val}, entry={entry})", flush=True)
             continue
 
