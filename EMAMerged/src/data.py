@@ -7,7 +7,6 @@ import requests
 import time
 import os
 
-
 # ------------------------
 # Resilient HTTP wrapper
 # ------------------------
@@ -19,23 +18,22 @@ def _req_with_retry(method: str, url: str, headers: dict, timeout: int = 20,
     while True:
         try:
             r = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
+            # Retry on throttle/server errors
             if r.status_code in RETRY_STATUS:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
             return r
-        except Exception:
+        except Exception as e:
             attempt += 1
             if attempt > max_retries:
                 raise
-            sleep_s = backoff_base * (2 ** (attempt - 1)) + (0.1 * attempt)
-            time.sleep(sleep_s)
+            sleep = backoff_base * (2 ** (attempt - 1))
+            time.sleep(sleep)
 
-# ------------------------
-# Alpaca helpers
-# ------------------------
 def _headers(key: str, secret: str) -> dict:
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
 def _now_utc() -> dt.datetime:
+    # timezone-aware UTC (no utcnow() deprecation)
     return dt.datetime.now(tz=dt.timezone.utc)
 
 def alpaca_market_open(base_url: str, key: str, secret: str) -> bool:
@@ -49,6 +47,9 @@ def _iso(dt_obj: dt.datetime) -> str:
         dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
     return dt_obj.isoformat()
 
+# ------------------------
+# Bars / Market data
+# ------------------------
 def get_alpaca_bars(
     key: str,
     secret: str,
@@ -66,17 +67,17 @@ def get_alpaca_bars(
     **_ignore: Any,  # safely swallow any unknown kwargs from older callers
 ) -> pd.DataFrame:
     """
-    Fetch bars from Alpaca v2. Accepts either explicit start/end OR a days/history_days lookback.
-    Backtester passes history_days=30; live code usually passes explicit start/end.
+    Fetch bars from Alpaca v2 data API.
+    timeframe: e.g. "1Min", "5Min", "15Min", "1Hour", "1Day"
     """
-    # Resolve lookback window
-    if start is None or end is None:
-        lookback = days if days is not None else history_days
-        if lookback is None:
-            lookback = 30  # sensible default
+    # Build date range if only history_days/days provided
+    if end is None:
         end = _now_utc()
-        start = end - dt.timedelta(days=int(lookback))
+    if start is None:
+        hd = history_days if history_days is not None else (days if days is not None else 5)
+        start = end - pd.Timedelta(days=int(hd))
 
+    # Data API v2 endpoint
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     params = {
         "timeframe": timeframe,
@@ -94,7 +95,7 @@ def get_alpaca_bars(
     df = pd.DataFrame(bars)
     # Normalize schema
     df["t"] = pd.to_datetime(df["t"], utc=True)
-    df = df.rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
+    df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     df = df.set_index("time").sort_index()
     return df
 
@@ -132,7 +133,9 @@ def drop_unclosed_last_bar(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     # only drop if bar is truly still in-progress for this timeframe
     return df.iloc[:-1] if (now - last) < pd.Timedelta(minutes=mins) else df
 
-# --- Orders / Positions / Open orders ---
+# ------------------------
+# Orders / Positions helpers
+# ------------------------
 def get_positions(base_url: str, key: str, secret: str) -> Dict[str, Dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/v2/positions"
     r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=15)
@@ -144,46 +147,36 @@ def get_positions(base_url: str, key: str, secret: str) -> Dict[str, Dict[str, A
         out[p["symbol"]] = p
     return out
 
-def get_open_orders(base_url: str, key: str, secret: str, symbol: str | None = None) -> list[dict]:
+def get_open_orders(base_url: str, key: str, secret: str) -> List[dict]:
     url = f"{base_url.rstrip('/')}/v2/orders?status=open&nested=true"
-    if symbol:
-        url += f"&symbols={symbol}"
     r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=15)
     return r.json() if r.text else []
 
-def submit_market_order(base_url: str, key: str, secret: str,
-                        symbol: str, qty: int, side: str, client_order_id: str | None = None) -> dict:
+def submit_market_order(base_url: str, key: str, secret: str, symbol: str, qty: int, side: str, tif: str = "day") -> dict:
     url = f"{base_url.rstrip('/')}/v2/orders"
-    payload = {
-        "symbol": symbol, "qty": qty, "side": side, "type": "market",
-        "time_in_force": "day"
-    }
-    if client_order_id:
-        payload["client_order_id"] = client_order_id
-    r = _req_with_retry("POST", url, headers=_headers(key, secret), json=payload, timeout=20)
-    return r.json()
+    order = {"symbol": symbol, "qty": int(qty), "side": side, "type": "market", "time_in_force": tif}
+    r = _req_with_retry("POST", url, headers=_headers(key, secret), timeout=20, json=order)
+    return r.json() if r.text else {}
 
-def submit_bracket_order(base_url: str, key: str, secret: str,
-                         symbol: str, qty: int, side: str,
-                         entry_type: str = "market", client_order_id: str | None = None,
-                         take_profit_price: float = 0.0, stop_price: float = 0.0,
-                         stop_limit_price: float | None = None) -> dict:
+def submit_bracket_order(base_url: str, key: str, secret: str, symbol: str, qty: int, side: str,
+                         limit_price: float | None, take_profit_price: float, stop_loss_price: float,
+                         tif: str = "day") -> dict:
     url = f"{base_url.rstrip('/')}/v2/orders"
     payload = {
         "symbol": symbol,
-        "qty": qty,
+        "qty": int(qty),
         "side": side,
-        "type": entry_type,
-        "time_in_force": "day",
+        "type": "limit" if limit_price is not None else "market",
+        "time_in_force": tif,
+        "limit_price": round(float(limit_price), 2) if limit_price is not None else None,
         "order_class": "bracket",
-        "client_order_id": client_order_id,
-        "take_profit": {"limit_price": round(take_profit_price, 2)},
-        "stop_loss":   {"stop_price": round(stop_price, 2)} if not stop_limit_price else
-                       {"stop_price": round(stop_limit_price if stop_limit_price < stop_price else stop_price, 2),
-                        "limit_price": round(stop_limit_price, 2)},
+        "take_profit": {"limit_price": round(float(take_profit_price), 2)},
+        "stop_loss": {"stop_price": round(float(stop_loss_price), 2)},
     }
-    r = _req_with_retry("POST", url, headers=_headers(key, secret), json=payload, timeout=20)
-    return r.json()
+    # Remove None fields cleanly
+    payload = {k: v for k, v in payload.items() if v is not None}
+    r = _req_with_retry("POST", url, headers=_headers(key, secret), timeout=20, json=payload)
+    return r.json() if r.text else {}
 
 def cancel_all_orders(base_url: str, key: str, secret: str) -> dict:
     url = f"{base_url.rstrip('/')}/v2/orders"
@@ -192,7 +185,7 @@ def cancel_all_orders(base_url: str, key: str, secret: str) -> dict:
 
 def close_all_positions(base_url: str, key: str, secret: str) -> dict:
     url = f"{base_url.rstrip('/')}/v2/positions"
-    r = _req_with_retry("DELETE", url, headers=_headers(key, secret), timeout=30)
+    r = _req_with_retry("DELETE", url, headers=_headers(key, secret), timeout=20)
     return r.json() if r.text else {}
 
 def list_open_orders(base_url: str, key: str, secret: str, symbols: list[str] | None = None) -> list[dict]:
@@ -208,6 +201,10 @@ def patch_order(base_url: str, key: str, secret: str, order_id: str, **fields) -
     url = f"{base_url.rstrip('/')}/v2/orders/{order_id}"
     r = _req_with_retry("PATCH", url, headers=_headers(key, secret), timeout=20, json=fields)
     return r.json() if r.text else {}
+
+# ------------------------
+# Option B: compute dollar_vol_avg BEFORE window trim
+# ------------------------
 def fetch_latest_bars(
     symbols: list[str],
     *,
@@ -224,12 +221,20 @@ def fetch_latest_bars(
     bar_limit: int = 10000,
     key: Optional[str] = None,
     secret: Optional[str] = None,
+    # Dollar-volume rolling config (Option B: compute BEFORE window trimming)
+    dollar_vol_window: int = 20,
+    dollar_vol_min_periods: int = 7,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Convenience wrapper used by live_paper_loop:
-      - fetches recent bars for each symbol
-      - drops the still-forming last bar (to avoid lookahead)
-      - optionally filters to regular trading hours and allowed entry windows
+    Fetch recent bars per symbol and return a dict[symbol]->DataFrame.
+
+    Option B: compute `dollar_vol_avg` on the full RTH slice BEFORE trimming
+    to `allowed_windows`, so the rolling has enough context from prior days.
+
+    Notes:
+      - We still drop the still-forming last bar to avoid lookahead.
+      - If rth_only is False, we compute dollar_vol_avg on the full df.
+      - Gating happens elsewhere; this function only prepares data.
     """
     # Resolve API creds from args or environment
     key = key or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY", "")
@@ -253,10 +258,34 @@ def fetch_latest_bars(
         # Drop any unclosed/partial last bar for the given timeframe
         df = drop_unclosed_last_bar(df, timeframe)
 
-        # Filter to RTH + optional entry windows
+        # Create the RTH slice first (WITHOUT allowed_windows) for stable rolling math
         if rth_only:
-            df = filter_rth(df, tz_name=tz_name, rth_start=rth_start, rth_end=rth_end, allowed_windows=allowed_windows)
+            rth_df = filter_rth(df, tz_name=tz_name, rth_start=rth_start, rth_end=rth_end, allowed_windows=None)
+        else:
+            rth_df = df
 
-        out[sym] = df
+        # Compute rolling dollar volume on the full RTH slice
+        if not rth_df.empty and {"close", "volume"}.issubset(rth_df.columns):
+            dv = (rth_df["close"].astype(float) * rth_df["volume"].astype(float)).rolling(
+                int(dollar_vol_window),
+                min_periods=int(dollar_vol_min_periods),
+            ).mean()
+            rth_df["dollar_vol_avg"] = dv.fillna(method="ffill").fillna(0.0)
+        else:
+            rth_df["dollar_vol_avg"] = 0.0
+
+        # Now optionally trim to allowed_windows while preserving computed columns
+        if rth_only and allowed_windows:
+            final_df = filter_rth(
+                rth_df,
+                tz_name=tz_name,
+                rth_start=rth_start,
+                rth_end=rth_end,
+                allowed_windows=allowed_windows,
+            )
+        else:
+            final_df = rth_df
+
+        out[sym] = final_df
 
     return out
