@@ -17,7 +17,9 @@ jobs:
           $python = (Get-Command python.exe).Source
           if (-not $python) { throw "python.exe not found on PATH" }
           "PYTHON_EXE=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONPATH=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Using Python: $python"
+          Write-Host "Exported PYTHONPATH=$env:GITHUB_WORKSPACE"
 
       - name: Install deps (requests, pandas, numpy, pyyaml, pytz)
         shell: powershell
@@ -34,159 +36,135 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           chcp 65001 > $null
-          $py = @'
-          import os, sys, json, datetime as dt, requests
-          from datetime import timezone
 
-          def log(obj): print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
-
-          base = (os.getenv("APCA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
-          key  = os.getenv("APCA_API_KEY_ID")
-          sec  = os.getenv("APCA_API_SECRET_KEY")
-          if not key or not sec:
-              sys.exit("Missing APCA_API_KEY_ID/APCA_API_SECRET_KEY")
-          H = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
-
-          # 1) Account
-          r = requests.get(f"{base}/v2/account", headers=H, timeout=8)
-          if r.status_code == 401:
-              sys.exit("401 Unauthorized from /v2/account – check Secrets and base URL.")
-          r.raise_for_status()
-          acct = r.json()
-          log({"type":"PREFLIGHT","stage":"account_ok","status":acct.get("status","?")})
-
-          # 2) Clock
-          r = requests.get(f"{base}/v2/clock", headers=H, timeout=8)
-          r.raise_for_status()
-          clock = r.json()
-          log({"type":"PREFLIGHT","stage":"clock_ok","is_open":clock.get("is_open"),"next_open":clock.get("next_open"),"next_close":clock.get("next_close")})
-
-          # 3) Positions
-          r = requests.get(f"{base}/v2/positions", headers=H, timeout=8)
-          if r.status_code not in (200, 404): r.raise_for_status()
-          count = len(r.json()) if r.ok and r.text.strip() else 0
-          log({"type":"PREFLIGHT","stage":"positions_ok","count":count})
-
-          # 4) Activities
-          r = requests.get(f"{base}/v2/account/activities", headers=H, timeout=8)
-          if r.status_code not in (200, 204): r.raise_for_status()
-          acts = r.json() if r.ok and r.text.strip() else []
-          log({"type":"PREFLIGHT","stage":"activities_ok","sample_count":len(acts)})
-
-          # 5) Market data probe (IEX). 403 is OK (plan not entitled) – don't fail.
-          try:
-              syms = ["AAPL","NVDA"]
-              end = dt.datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
-              start = (dt.datetime.now(timezone.utc) - dt.timedelta(days=2)).replace(microsecond=0).isoformat().replace("+00:00","Z")
-              params = {"symbols": ",".join(syms), "timeframe": "15Min", "start": start, "end": end, "limit": 50, "feed": "iex"}
-              r = requests.get("https://data.alpaca.markets/v2/stocks/bars", headers=H, params=params, timeout=10)
-              if r.status_code == 403:
-                  log({"type":"PREFLIGHT","stage":"bars_forbidden","feed":"iex","note":"403 from data API (plan not entitled). Trading can still proceed."})
-              else:
-                  r.raise_for_status()
-                  bars = r.json().get("bars", {})
-                  log({"type":"PREFLIGHT","stage":"bars_ok","timeframe":"15Min","feed":"iex","symbols":list(bars.keys())})
-          except Exception as e:
-              log({"type":"PREFLIGHT","stage":"bars_check_skipped","error":str(e)})
-
-          log({"type":"PREFLIGHT","stage":"complete","ok":True})
-          '@
-          $py | & "$env:PYTHON_EXE" -
+          $file = "preflight_auth_probe.py"
+          $lines = @(
+            "import os, sys, json, datetime as dt, requests",
+            "from datetime import timezone",
+            "def log(obj): print(json.dumps(obj, separators=(',', ':'), ensure_ascii=False))",
+            "base = (os.getenv('APCA_BASE_URL') or 'https://paper-api.alpaca.markets').rstrip('/')",
+            "key  = os.getenv('APCA_API_KEY_ID')",
+            "sec  = os.getenv('APCA_API_SECRET_KEY')",
+            "if not key or not sec: sys.exit('Missing APCA_API_KEY_ID/APCA_API_SECRET_KEY')",
+            "H = {'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': sec}",
+            "r = requests.get(f'{base}/v2/account', headers=H, timeout=8)",
+            "if r.status_code == 401: sys.exit('401 Unauthorized from /v2/account – check Secrets and base URL.')",
+            "r.raise_for_status(); acct = r.json()",
+            "log({'type':'PREFLIGHT','stage':'account_ok','status':acct.get('status','?')})",
+            "r = requests.get(f'{base}/v2/clock', headers=H, timeout=8)",
+            "r.raise_for_status(); clock = r.json()",
+            "log({'type':'PREFLIGHT','stage':'clock_ok','is_open':clock.get('is_open'),'next_open':clock.get('next_open'),'next_close':clock.get('next_close')})",
+            "r = requests.get(f'{base}/v2/positions', headers=H, timeout=8)",
+            "if r.status_code not in (200, 404): r.raise_for_status()",
+            "count = len(r.json()) if r.ok and r.text.strip() else 0",
+            "log({'type':'PREFLIGHT','stage':'positions_ok','count':count})",
+            "r = requests.get(f'{base}/v2/account/activities', headers=H, timeout=8)",
+            "if r.status_code not in (200, 204): r.raise_for_status()",
+            "acts = r.json() if r.ok and r.text.strip() else []",
+            "log({'type':'PREFLIGHT','stage':'activities_ok','sample_count':len(acts)})",
+            "try:",
+            "    syms = ['AAPL','NVDA']",
+            "    end = dt.datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z')",
+            "    start = (dt.datetime.now(timezone.utc) - dt.timedelta(days=2)).replace(microsecond=0).isoformat().replace('+00:00','Z')",
+            "    params = {'symbols': ','.join(syms), 'timeframe': '15Min', 'start': start, 'end': end, 'limit': 50, 'feed': 'iex'}",
+            "    r = requests.get('https://data.alpaca.markets/v2/stocks/bars', headers=H, params=params, timeout=10)",
+            "    if r.status_code == 403:",
+            "        log({'type':'PREFLIGHT','stage':'bars_forbidden','feed':'iex','note':'403 from data API (plan not entitled). Trading can still proceed.'})",
+            "    else:",
+            "        r.raise_for_status(); bars = r.json().get('bars', {})",
+            "        log({'type':'PREFLIGHT','stage':'bars_ok','timeframe':'15Min','feed':'iex','symbols':list(bars.keys())})",
+            "except Exception as e:",
+            "    log({'type':'PREFLIGHT','stage':'bars_check_skipped','error':str(e)})",
+            "log({'type':'PREFLIGHT','stage':'complete','ok':True})"
+          )
+          [System.IO.File]::WriteAllLines($file, $lines)
+          & "$env:PYTHON_EXE" $file
+          Remove-Item $file -Force
 
       - name: Repo sanity and UTC deprecation check
         shell: powershell
         run: |
           chcp 65001 > $null
-          $py = @'
-          import os, sys, json
-          from pathlib import Path
 
-          root = Path.cwd()
-          def read(p):
-              try: return p.read_text(encoding="utf-8", errors="ignore")
-              except: return ""
-
-          must_exist = [
-              "EMAMerged/scripts/live_paper_loop.py",
-              "EMAMerged/src/filters.py",
-              "EMAMerged/src/data.py",
-              "EMAMerged/src/trade_logger.py",
-              "EMAMerged/config.yaml",
-          ]
-          missing = [p for p in must_exist if not (root/p).exists()]
-          if missing:
-              raise SystemExit("Missing required files: " + ", ".join(missing))
-
-          utc_hits = []
-          for p in root.rglob("*.py"):
-              txt = read(p)
-              if "utcnow()" in txt:
-                  utc_hits.append(str(p))
-          if utc_hits:
-              raise SystemExit("utcnow() still present in: " + ", ".join(utc_hits))
-
-          orphan = root / "EMAMerged/src/trader_logger.py"
-          print(json.dumps({
-              "type":"REPO_SANITY",
-              "utcnow_count": 0,
-              "trader_logger_present": orphan.exists()
-          }))
-          if orphan.exists():
-              raise SystemExit("Orphan EMAMerged/src/trader_logger.py should be removed")
-          '@
-          $py | & "$env:PYTHON_EXE" -
+          $file = "repo_sanity.py"
+          $lines = @(
+            "import json",
+            "from pathlib import Path",
+            "root = Path.cwd()",
+            "def read(p):",
+            "    try: return p.read_text(encoding='utf-8', errors='ignore')",
+            "    except: return ''",
+            "must = [",
+            "  'EMAMerged/scripts/live_paper_loop.py',",
+            "  'EMAMerged/src/filters.py',",
+            "  'EMAMerged/src/data.py',",
+            "  'EMAMerged/src/trade_logger.py',",
+            "  'EMAMerged/config.yaml',",
+            "]",
+            "missing = [p for p in must if not (root/p).exists()]",
+            "if missing:",
+            "    raise SystemExit('Missing required files: ' + ', '.join(missing))",
+            "hits = []",
+            "for p in root.rglob('*.py'):",
+            "    if 'utcnow()' in read(p): hits.append(str(p))",
+            "if hits:",
+            "    raise SystemExit('utcnow() still present in: ' + ', '.join(hits))",
+            "orphan = root / 'EMAMerged/src/trader_logger.py'",
+            "print(json.dumps({'type':'REPO_SANITY','utcnow_count':0,'trader_logger_present':orphan.exists()}))",
+            "if orphan.exists():",
+            "    raise SystemExit('Orphan EMAMerged/src/trader_logger.py should be removed')"
+          )
+          [System.IO.File]::WriteAllLines($file, $lines)
+          & "$env:PYTHON_EXE" $file
+          Remove-Item $file -Force
 
       - name: Unit - indicators and gate logic (synthetic)
         shell: powershell
         run: |
           chcp 65001 > $null
-          $py = @'
-          import json
-          import numpy as np, pandas as pd
-          from datetime import datetime, timezone, timedelta
 
-          from EMAMerged.src.filters import attach_verifiers, long_ok, explain_long_gate
-
-          # Synthetic 15m uptrend: ema_fast > ema_slow and positive slope
-          idx = pd.date_range(datetime.now(timezone.utc) - timedelta(hours=8),
-                              periods=64, freq="15min", tz="UTC")
-          close_up = pd.Series(np.linspace(100, 104, len(idx)) + np.sin(np.linspace(0, 6.28, len(idx)))*0.2, index=idx)
-          vol = pd.Series(np.random.randint(100_000, 200_000, len(idx)), index=idx)
-
-          df = pd.DataFrame({"close": close_up, "open": close_up, "high": close_up+0.1, "low": close_up-0.1, "volume": vol})
-          cfg = {
-            "ema_fast": 9, "ema_slow": 21, "rsi_length": 14,
-            "filters": {
-              "require_fast_above_slow": True,
-              "adx_threshold": 0,
-              "rsi_min": 0, "rsi_max": 100,
-              "slope_threshold_pct": 0.0001
-            }
-          }
-          df = attach_verifiers(df, cfg)
-          last = df.iloc[-1]
-          ok1 = long_ok(last, cfg)
-          assert ok1, f"Expected True long_ok on uptrend; reasons={explain_long_gate(last, cfg)}"
-          assert float(last["ema_slope_pct"]) > 0, "ema_slope_pct should be > 0 on uptrend"
-
-          # Synthetic downtrend: should FAIL require_fast_above_slow
-          close_dn = pd.Series(np.linspace(104, 100, len(idx)), index=idx)
-          df2 = pd.DataFrame({"close": close_dn, "open": close_dn, "high": close_dn+0.1, "low": close_dn-0.1, "volume": vol})
-          df2 = attach_verifiers(df2, cfg)
-          last2 = df2.iloc[-1]
-          ok2, reasons2 = explain_long_gate(last2, cfg)
-          assert not ok2 and any("ema_fast" in r for r in reasons2), f"Expected fast<=slow block; reasons={reasons2}"
-
-          print(json.dumps({"type":"UNIT_INDICATORS","ok_uptrend":bool(ok1),"blocked_downtrend":bool(not ok2)}, separators=(",",":")))
-          '@
-          $py | & "$env:PYTHON_EXE" -
+          $file = "unit_indicators.py"
+          $lines = @(
+            "import json",
+            "import numpy as np, pandas as pd",
+            "from datetime import datetime, timezone, timedelta",
+            "from EMAMerged.src.filters import attach_verifiers, long_ok, explain_long_gate",
+            "idx = pd.date_range(datetime.now(timezone.utc) - timedelta(hours=8), periods=64, freq='15min', tz='UTC')",
+            "close_up = pd.Series(np.linspace(100, 104, len(idx)) + np.sin(np.linspace(0, 6.28, len(idx)))*0.2, index=idx)",
+            "vol = pd.Series(np.random.randint(100000, 200000, len(idx)), index=idx)",
+            "df = pd.DataFrame({'close': close_up, 'open': close_up, 'high': close_up+0.1, 'low': close_up-0.1, 'volume': vol})",
+            "cfg = {",
+            "  'ema_fast': 9, 'ema_slow': 21, 'rsi_length': 14,",
+            "  'filters': {",
+            "    'require_fast_above_slow': True,",
+            "    'adx_threshold': 0,",
+            "    'rsi_min': 0, 'rsi_max': 100,",
+            "    'slope_threshold_pct': 0.0001",
+            "  }",
+            "}",
+            "df = attach_verifiers(df, cfg)",
+            "last = df.iloc[-1]",
+            "ok1 = long_ok(last, cfg)",
+            "assert ok1, f'Expected True long_ok on uptrend; reasons={explain_long_gate(last, cfg)}'",
+            "assert float(last['ema_slope_pct']) > 0, 'ema_slope_pct should be > 0 on uptrend'",
+            "close_dn = pd.Series(np.linspace(104, 100, len(idx)), index=idx)",
+            "df2 = pd.DataFrame({'close': close_dn, 'open': close_dn, 'high': close_dn+0.1, 'low': close_dn-0.1, 'volume': vol})",
+            "df2 = attach_verifiers(df2, cfg)",
+            "last2 = df2.iloc[-1]",
+            "ok2, reasons2 = explain_long_gate(last2, cfg)",
+            "assert (not ok2) and any('ema_fast' in r for r in reasons2), f'Expected fast<=slow block; reasons={reasons2}'",
+            "print(json.dumps({'type':'UNIT_INDICATORS','ok_uptrend':bool(ok1),'blocked_downtrend':bool(not ok2)}, separators=(',',':')))"
+          )
+          [System.IO.File]::WriteAllLines($file, $lines)
+          & "$env:PYTHON_EXE" $file
+          Remove-Item $file -Force
 
       - name: Live loop - DRY-RUN flatten path should trigger (no orders)
         shell: powershell
         env:
           APCA_BASE_URL: https://paper-api.alpaca.markets
           APCA_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
           chcp 65001 > $null
@@ -195,7 +173,6 @@ jobs:
           $cfgOut = "EMAMerged\config.preflight.flatten.yaml"
           $helper = "write_flatten_cfg.py"
 
-          # Write helper without here-strings (no fragile terminators)
           $lines = @(
             "import sys, yaml",
             "src, dst = sys.argv[1], sys.argv[2]",
@@ -212,8 +189,7 @@ jobs:
           $outPath = & "$env:PYTHON_EXE" $helper $cfgIn $cfgOut
           Write-Host "Wrote: $outPath"
           if (-not (Test-Path $cfgOut)) { throw "Failed to write $cfgOut" }
-
           Remove-Item $helper -Force
 
-          # Run the live loop in DRY-RUN (single line to avoid backtick issues)
-          & "$env:PYTHON_EXE" -X utf8 -u EMAMerged\scripts\live_paper_loop.py --config $cfgOut --tickers EMAMerged\tickers.txt --dry-run 1 --force-run 1
+          # Run the live loop as a module (ensures EMAMerged imports resolve)
+          & "$env:PYTHON_EXE" -X utf8 -m EMAMerged.scripts.live_paper_loop --config $cfgOut --tickers EMAMerged\tickers.txt --dry-run 1 --force-run 1
