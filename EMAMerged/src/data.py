@@ -1,260 +1,177 @@
 # === EMAMerged/src/data.py ===
 from __future__ import annotations
 
-import os, json, time, math, datetime as dt
-from typing import Dict, Any, List, Optional, Tuple
+import os, json, math, time, datetime as dt
+from typing import Dict, List, Any, Optional, Tuple
 import requests
 import pandas as pd
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HTTP helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _headers(key: str, secret: str) -> Dict[str, str]:
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _print_json(obj: Dict[str, Any]) -> None:
+    """
+    Emit a compact JSON line for logs (UTF-8, single line).
+    """
+    try:
+        print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False), flush=True)
+    except Exception:
+        # never fail the trading loop on logging
+        pass
+
+def _alpaca_headers(key: str, secret: str) -> Dict[str, str]:
     return {
-        "APCA-API-KEY-ID": key or os.getenv("APCA_API_KEY_ID", ""),
-        "APCA-API-SECRET-KEY": secret or os.getenv("APCA_API_SECRET_KEY", ""),
+        "APCA-API-KEY-ID": key or "",
+        "APCA-API-SECRET-KEY": secret or "",
         "Content-Type": "application/json",
     }
 
-def _req_with_retry(method: str, url: str, retries: int = 2, backoff: float = 0.6, **kw) -> requests.Response:
-    last = None
-    for i in range(retries + 1):
+def _req_json(method: str, url: str, headers: Dict[str, str], timeout: int = 20, **kw) -> Tuple[int, Dict[str, Any], str]:
+    """
+    Safe HTTP wrapper — always returns (status_code, json_or_empty, text).
+    """
+    try:
+        r = requests.request(method, url, headers=headers, timeout=timeout, **kw)
         try:
-            r = requests.request(method, url, **kw)
-            if r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} {r.text}")
-            return r
-        except Exception as e:
-            last = e
-            if i == retries:
-                raise
-            time.sleep(backoff * (2 ** i))
-    # Shouldn’t get here
-    if isinstance(last, requests.Response):
-        return last
-    raise RuntimeError(str(last) if last else "unknown error")
+            j = r.json() if (r.text and r.headers.get("content-type", "").lower().startswith("application/json")) else {}
+        except Exception:
+            j = {}
+        return r.status_code, j, (r.text or "")
+    except Exception as e:
+        return -1, {}, f"{type(e).__name__}: {e}"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Market status / account data
-# ──────────────────────────────────────────────────────────────────────────────
+def _chunk_symbols(symbols: List[str], max_per_chunk: int = 45) -> List[List[str]]:
+    """
+    Alpaca multi-symbol bars endpoint works fine up to ~50 symbols per call.
+    We stay under that (45) to avoid 414 URL or internal limits.
+    """
+    clean = [s.strip().upper() for s in symbols if s and s.strip()]
+    return [clean[i:i + max_per_chunk] for i in range(0, len(clean), max_per_chunk)]
+
+def _parse_hhmm(s: str) -> Tuple[int, int]:
+    hh, mm = s.split(":")
+    return int(hh), int(mm)
+
+def filter_rth(df: pd.DataFrame, tz_name: str, start_hm: str, end_hm: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    # Convert to local tz, apply intraday time mask, convert back to UTC
+    local = df.copy()
+    local.index = local.index.tz_convert(tz_name)
+
+    sh, sm = _parse_hhmm(start_hm)
+    eh, em = _parse_hhmm(end_hm)
+    mask = (local.index.hour > sh) | ((local.index.hour == sh) & (local.index.minute >= sm))
+    mask &= (local.index.hour < eh) | ((local.index.hour == eh) & (local.index.minute <= em))
+
+    kept = local[mask]
+    kept.index = kept.index.tz_convert("UTC")
+    return kept
+
+def drop_unclosed_last_bar(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Drop the last row if it is likely still forming.
+    Heuristic: if now_utc < last_ts + bar_delta.
+    """
+    if df.empty:
+        return df
+    tf = timeframe.lower()
+    if tf.endswith("min"):
+        try:
+            minutes = int(tf.replace("min", ""))
+        except Exception:
+            minutes = 15
+        delta = dt.timedelta(minutes=minutes)
+    elif tf.endswith("hour"):
+        try:
+            hours = int(tf.replace("hour", ""))
+        except Exception:
+            hours = 1
+        delta = dt.timedelta(hours=hours)
+    else:
+        # Fallback for e.g. "15Min" formats
+        num = "".join(ch for ch in tf if ch.isdigit())
+        minutes = int(num) if num else 15
+        delta = dt.timedelta(minutes=minutes)
+
+    last_ts = df.index[-1]
+    if dt.datetime.now(dt.UTC) < (last_ts + delta):
+        return df.iloc[:-1]
+    return df
+
+def _to_df(bars_list: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Convert Alpaca bars list (dicts with keys t,o,h,l,c,v,...) into DataFrame.
+    Index is UTC Timestamp.
+    """
+    if not bars_list:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"], dtype="float64")
+
+    raw = pd.DataFrame(bars_list)
+    # Expect 't','o','h','l','c','v'
+    rename = {"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "time"}
+    for k in rename:
+        if k not in raw.columns:
+            raw[k] = None
+    raw = raw.rename(columns=rename)
+
+    # Parse UTC time
+    idx = pd.to_datetime(raw["time"], utc=True, errors="coerce")
+    raw = raw.assign(index_ts=idx).dropna(subset=["index_ts"]).set_index("index_ts").sort_index()
+
+    cols = ["open", "high", "low", "close", "volume"]
+    for c in cols:
+        if c not in raw.columns:
+            raw[c] = float("nan")
+    return raw[cols]
+
+def _rolling_dollar_vol(df: pd.DataFrame, window: int, min_periods: int) -> pd.Series:
+    dv = (df["close"] * df["volume"]).rolling(window=window, min_periods=min_periods).mean()
+    # Avoid deprecated fillna(method=...) — use .ffill() / .bfill()
+    return dv.ffill().fillna(0.0)
+
+# ---------------------------------------------------------------------
+# Public: Market status & risk ops
+# ---------------------------------------------------------------------
+
 def alpaca_market_open(base_url: str, key: str, secret: str) -> bool:
     url = f"{base_url.rstrip('/')}/v2/clock"
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=15)
-    try:
-        return bool(r.json().get("is_open"))
-    except Exception:
+    st, j, _ = _req_json("GET", url, _alpaca_headers(key, secret), timeout=10)
+    if st != 200:
+        _print_json({"type": "CLOCK_ERROR", "status": st, "when": _now_iso()})
         return False
+    return bool(j.get("is_open"))
+
+def cancel_all_orders(base_url: str, key: str, secret: str) -> Dict[str, Any]:
+    url = f"{base_url.rstrip('/')}/v2/orders"
+    st, j, txt = _req_json("DELETE", url, _alpaca_headers(key, secret), timeout=20)
+    if st not in (200, 204):
+        _print_json({"type": "CANCEL_ALL_ERROR", "status": st, "text": txt[:200]})
+    return j or {}
+
+def close_all_positions(base_url: str, key: str, secret: str) -> Dict[str, Any]:
+    url = f"{base_url.rstrip('/')}/v2/positions"
+    st, j, txt = _req_json("DELETE", url, _alpaca_headers(key, secret), timeout=20)
+    if st not in (200, 207):  # 207 Multi-Status sometimes
+        _print_json({"type": "CLOSE_ALL_ERROR", "status": st, "text": txt[:200]})
+    return j or {}
 
 def get_positions(base_url: str, key: str, secret: str) -> Dict[str, Dict[str, Any]]:
-    """Return positions keyed by symbol."""
     url = f"{base_url.rstrip('/')}/v2/positions"
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), timeout=20)
+    st, j, txt = _req_json("GET", url, _alpaca_headers(key, secret), timeout=12)
+    if st != 200:
+        _print_json({"type": "GET_POSITIONS_ERROR", "status": st, "text": txt[:200]})
+        return {}
     out: Dict[str, Dict[str, Any]] = {}
-    try:
-        arr = r.json() if r.text else []
-        for p in arr or []:
-            sym = p.get("symbol")
-            if sym:
-                out[sym] = p
-    except Exception:
-        pass
+    for pos in (j if isinstance(j, list) else []):
+        sym = (pos.get("symbol") or "").upper()
+        if sym:
+            out[sym] = pos
     return out
-
-def list_open_orders(base_url: str, key: str, secret: str, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    url = f"{base_url.rstrip('/')}/v2/orders"
-    params = {"status": "open", "nested": "true"}
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), params=params, timeout=20)
-    try:
-        arr = r.json() if r.text else []
-        if symbols:
-            sy = set(s.upper() for s in symbols)
-            arr = [o for o in arr if (o.get("symbol") or "").upper() in sy]
-        return arr
-    except Exception:
-        return []
-
-# Back-compat alias used in some earlier code/tests
-def get_open_orders(base_url: str, key: str, secret: str, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    return list_open_orders(base_url, key, secret, symbols)
-
-def patch_order(base_url: str, key: str, secret: str, order_id: str, **fields) -> Dict[str, Any]:
-    url = f"{base_url.rstrip('/')}/v2/orders/{order_id}"
-    r = _req_with_retry("PATCH", url, headers=_headers(key, secret), json=fields, timeout=20)
-    try:
-        return r.json() if r.text else {}
-    except Exception:
-        return {"status_code": r.status_code, "text": r.text}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Risk ops
-# ──────────────────────────────────────────────────────────────────────────────
-def cancel_all_orders(base_url: str, key: str, secret: str) -> dict:
-    url = f"{base_url.rstrip('/')}/v2/orders"
-    params = {"status": "open"}
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), params=params, timeout=20)
-    try:
-        arr = r.json() if r.text else []
-    except Exception:
-        arr = []
-    deleted = []
-    for o in arr:
-        oid = o.get("id")
-        if not oid:
-            continue
-        try:
-            r2 = _req_with_retry("DELETE", f"{base_url.rstrip('/')}/v2/orders/{oid}", headers=_headers(key, secret), timeout=20)
-            deleted.append({"id": oid, "status_code": r2.status_code})
-        except Exception as e:
-            deleted.append({"id": oid, "error": str(e)})
-    return {"deleted": deleted, "count": len(deleted)}
-
-def close_all_positions(base_url: str, key: str, secret: str) -> dict:
-    url = f"{base_url.rstrip('/')}/v2/positions"
-    r = _req_with_retry("DELETE", url, headers=_headers(key, secret), timeout=30)
-    try:
-        return r.json() if r.text else {}
-    except Exception:
-        return {"status_code": r.status_code, "text": r.text}
-
-def close_position(base_url: str, key: str, secret: str, symbol: str) -> dict:
-    """Close (liquidate) a single open position by symbol."""
-    url = f"{base_url.rstrip('/')}/v2/positions/{symbol}"
-    r = _req_with_retry("DELETE", url, headers=_headers(key, secret), timeout=20)
-    try:
-        return r.json() if r.text else {}
-    except Exception:
-        return {"status_code": r.status_code, "text": r.text}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Bar fetch (Option B, with dollar_vol rolling & RTH filtering)
-# ──────────────────────────────────────────────────────────────────────────────
-def _et_window_mask(idx_utc: pd.DatetimeIndex,
-                    tz_name: str,
-                    rth_start: str,
-                    rth_end: str,
-                    allowed_windows: Optional[List[Dict[str, str]]] = None) -> pd.Series:
-    """Build mask for regular session and (optionally) sub-windows."""
-    if idx_utc.tz is None:
-        idx_utc = idx_utc.tz_localize("UTC")
-    idx_et = idx_utc.tz_convert(tz_name)
-    hm = idx_et.strftime("%H:%M")
-
-    # Base RTH mask
-    s_h, s_m = map(int, rth_start.split(":"))
-    e_h, e_m = map(int, rth_end.split(":"))
-    base = (hm >= f"{s_h:02d}:{s_m:02d}") & (hm <= f"{e_h:02d}:{e_m:02d}")
-
-    if not allowed_windows:
-        return base
-
-    # Apply “allowed” sub-windows inside RTH
-    allow = pd.Series(False, index=idx_utc)
-    for w in allowed_windows:
-        ws = w.get("start", rth_start); we = w.get("end", rth_end)
-        allow |= (hm >= ws) & (hm <= we)
-    return base & allow
-
-def fetch_latest_bars(
-    symbols: List[str],
-    timeframe: str = "15Min",
-    history_days: int = 10,
-    feed: str = "iex",
-    rth_only: bool = True,
-    tz_name: str = "US/Eastern",
-    rth_start: str = "09:30",
-    rth_end: str = "15:55",
-    allowed_windows: Optional[List[Dict[str,str]]] = None,
-    bar_limit: int = 10000,
-    key: str = "",
-    secret: str = "",
-    dollar_vol_window: int = 20,
-    dollar_vol_min_periods: int = 7,
-) -> Dict[str, pd.DataFrame]:
-    """Return {symbol: DataFrame(OHLCV + dollar_vol_avg)}."""
-    if not symbols:
-        return {}
-
-    base_data = "https://data.alpaca.markets"
-    end = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    start = (dt.datetime.now(dt.UTC) - dt.timedelta(days=history_days)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-    params = {
-        "symbols": ",".join([s.upper() for s in symbols]),
-        "timeframe": timeframe,
-        "start": start,
-        "end": end,
-        "limit": bar_limit,
-        "feed": feed,
-    }
-    url = f"{base_data}/v2/stocks/bars"
-    r = _req_with_retry("GET", url, headers=_headers(key, secret), params=params, timeout=30)
-    try:
-        root = r.json()
-        raw = root.get("bars", {})
-    except Exception:
-        return {}
-
-    out: Dict[str, pd.DataFrame] = {}
-    for sym, rows in (raw or {}).items():
-        if not rows:
-            continue
-        df = pd.DataFrame(rows)
-        # Normalize timestamp index
-        ts_col = "t" if "t" in df.columns else "timestamp"
-        df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-        df = df.set_index(ts_col).sort_index()
-        # Normalize columns to expected names
-        rename_map = {
-            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
-            "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
-        }
-        df = df.rename(columns=rename_map)
-        keep = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
-        df = df[keep].copy()
-
-        # RTH / windows
-        if rth_only:
-            mask = _et_window_mask(df.index, tz_name, rth_start, rth_end, allowed_windows)
-            df = df.loc[mask].copy()
-            if df.empty:
-                out[sym] = df
-                continue
-
-        # Dollar volume rolling mean (deprecation-safe)
-        dv = (pd.to_numeric(df["close"], errors="coerce").fillna(0.0) *
-              pd.to_numeric(df["volume"], errors="coerce").fillna(0.0))
-        rth_df = df.copy()
-        rth_df["dollar_vol_avg"] = (
-            dv.rolling(window=int(max(1, dollar_vol_window)),
-                       min_periods=int(max(1, dollar_vol_min_periods)))
-              .mean()
-              .ffill()        # <- replaces fillna(method="ffill")
-              .fillna(0.0)
-        )
-
-        out[sym] = rth_df
-
-    return out
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Bracket entry (with exchange tick guard)
-# ──────────────────────────────────────────────────────────────────────────────
-def _q_tick(px: float, tick: float, mode: str) -> float:
-    """Quantize to exchange tick with directional bias (ceil/floor)."""
-    if tick <= 0:
-        return round(px, 2)
-    q = int(round(px / tick))
-    # directional bias
-    if mode == "up":
-        if abs(q * tick - px) < 1e-12:
-            return q * tick
-        return (math.floor(px / tick) + 1) * tick
-    if mode == "down":
-        if abs(q * tick - px) < 1e-12:
-            return q * tick
-        return math.floor(px / tick) * tick
-    # nearest
-    return q * tick
 
 def submit_bracket_order(
     base_url: str,
@@ -264,61 +181,169 @@ def submit_bracket_order(
     symbol: str,
     qty: int,
     side: str,
-    limit_price: Optional[float] = None,   # None => market entry
+    limit_price: Optional[float],
     take_profit_price: float,
     stop_loss_price: float,
     tif: str = "day",
-    tick_size: float = 0.01,               # equities tick
-    ensure_tp_sl_buffer_ticks: int = 1,    # extra cushion to avoid 422 on base_price
 ) -> Dict[str, Any]:
-    """
-    Create a simple bracket (parent entry + TP/SL children). Prices are snapped
-    to tick grid with directional bias to respect Alpaca's '>= base + 0.01' rule.
-    """
-    s = (side or "").lower()
-    if s not in ("buy", "sell"):
-        raise ValueError("side must be 'buy' or 'sell'")
-
-    q = max(1, int(qty))
-
-    # Snap child prices to tick grid with correct bias
-    if s == "buy":
-        tp = _q_tick(float(take_profit_price), tick_size, "up")
-        sl = _q_tick(float(stop_loss_price),  tick_size, "down")
-        # Add a small buffer (1 tick by default) to survive tiny base_price moves
-        tp += ensure_tp_sl_buffer_ticks * tick_size
-        sl -= ensure_tp_sl_buffer_ticks * tick_size
-    else:  # sell/short
-        tp = _q_tick(float(take_profit_price), tick_size, "down")
-        sl = _q_tick(float(stop_loss_price),  tick_size, "up")
-        tp -= ensure_tp_sl_buffer_ticks * tick_size
-        sl += ensure_tp_sl_buffer_ticks * tick_size
-
-    # If a limit entry is used, snap it too
-    entry_payload: Dict[str, Any] = {"symbol": symbol.upper(), "side": s, "time_in_force": tif}
-    if limit_price is None:
-        entry_payload["type"] = "market"
-        # parent market entry
-    else:
-        # Snap limit entry opposite to adverse direction (conservative):
-        #  - buy limit: round DOWN (more likely to be accepted)
-        #  - sell limit: round UP
-        lim_mode = "down" if s == "buy" else "up"
-        lp = _q_tick(float(limit_price), tick_size, lim_mode)
-        entry_payload.update({"type": "limit", "limit_price": float(f"{lp:.2f}")})
-
-    # Compose bracket
-    payload = {
-        **entry_payload,
-        "qty": q,
+    url = f"{base_url.rstrip('/')}/v2/orders"
+    payload: Dict[str, Any] = {
+        "symbol": symbol.upper(),
+        "qty": int(qty),
+        "side": side.lower(),
+        "type": "market" if (limit_price in (None, 0)) else "limit",
+        "time_in_force": str(tif).lower(),
         "order_class": "bracket",
-        "take_profit": {"limit_price": float(f"{tp:.2f}")},
-        "stop_loss":   {"stop_price":  float(f"{sl:.2f}")},
+        "take_profit": {"limit_price": float(take_profit_price)},
+        "stop_loss": {"stop_price": float(stop_loss_price)},
+    }
+    if limit_price not in (None, 0):
+        payload["limit_price"] = float(limit_price)
+
+    st, j, txt = _req_json("POST", url, _alpaca_headers(key, secret), timeout=20, json=payload)
+    if st not in (200, 201, 202):
+        _print_json({"type": "ORDER_SUBMIT_ERROR", "status": st, "text": txt[:300], "symbol": symbol, "when": _now_iso()})
+        # Return the error body so the caller can log it
+        return j or {"status": st, "error": txt[:300]}
+    return j or {}
+
+# ---------------------------------------------------------------------
+# Public: Bars fetch with rich diagnostics
+# ---------------------------------------------------------------------
+
+def fetch_latest_bars(
+    symbols: List[str],
+    *,
+    timeframe: str,
+    history_days: int,
+    feed: str,
+    rth_only: bool,
+    tz_name: str,
+    rth_start: str,
+    rth_end: str,
+    allowed_windows: Optional[List[Dict[str, str]]] = None,
+    bar_limit: int = 10000,
+    key: str,
+    secret: str,
+    dollar_vol_window: int = 20,
+    dollar_vol_min_periods: int = 7,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch bars for all symbols with detailed chunk diagnostics.
+    Returns a dict mapping symbol -> DataFrame (UTC index).
+    Adds a special '__meta__' key containing a diagnostics dict.
+    """
+    symbols = [s.strip().upper() for s in symbols if s and s.strip()]
+    H = _alpaca_headers(key, secret)
+    base_data_url = "https://data.alpaca.markets/v2/stocks/bars"
+
+    # Time bounds
+    end_iso = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    start_iso = (dt.datetime.now(dt.UTC) - dt.timedelta(days=int(history_days))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    chunks = _chunk_symbols(symbols)
+    diag: Dict[str, Any] = {
+        "type": "BARS_FETCH",
+        "requested": len(symbols),
+        "timeframe": timeframe,
+        "history_days": int(history_days),
+        "feed": feed,
+        "chunks": [],
+        "http_errors": [],
+        "symbols_with_data": [],
+        "symbols_empty": [],
+        "stale_symbols": [],  # last bar older than 1d
+        "when": _now_iso(),
     }
 
-    url = f"{base_url.rstrip('/')}/v2/orders"
-    r = _req_with_retry("POST", url, headers=_headers(key, secret), json=payload, timeout=25)
-    try:
-        return r.json() if r.text else {}
-    except Exception:
-        return {"status_code": r.status_code, "text": r.text}
+    out: Dict[str, pd.DataFrame] = {}
+
+    # Header log
+    _print_json({
+        "type": "BARS_FETCH_START",
+        "requested": len(symbols),
+        "chunks": len(chunks),
+        "timeframe": timeframe,
+        "feed": feed,
+        "start": start_iso,
+        "end": end_iso,
+        "when": _now_iso(),
+    })
+
+    for i, chunk in enumerate(chunks, 1):
+        params = {
+            "symbols": ",".join(chunk),
+            "timeframe": timeframe,
+            "start": start_iso,
+            "end": end_iso,
+            "limit": int(bar_limit),
+            "feed": feed,
+        }
+        st, j, txt = _req_json("GET", base_data_url, H, timeout=20, params=params)
+        chunk_info = {"idx": i, "count": len(chunk), "status": st, "symbols": chunk[:6] + (["..."] if len(chunk) > 6 else [])}
+        diag["chunks"].append(chunk_info)
+
+        if st != 200:
+            diag["http_errors"].append({"idx": i, "status": st, "text": (txt or "")[:200]})
+            _print_json({"type": "BARS_FETCH_CHUNK_ERROR", "idx": i, "status": st, "text": (txt or "")[:200], "when": _now_iso()})
+            # Continue to next chunk — we want the rest to load
+            continue
+
+        bars_map = (j.get("bars") or {}) if isinstance(j, dict) else {}
+        # Per symbol build
+        for sym in chunk:
+            recs = bars_map.get(sym) or []
+            df = _to_df(recs)
+
+            # RTH trimming
+            if rth_only:
+                df = filter_rth(df, tz_name=tz_name, start_hm=rth_start, end_hm=rth_end)
+
+            # Drop an unclosed last bar
+            df = drop_unclosed_last_bar(df, timeframe=timeframe)
+
+            # Dollar volume rolling average column (used by filters)
+            if not df.empty:
+                try:
+                    df["dollar_vol_avg"] = _rolling_dollar_vol(df, window=int(dollar_vol_window), min_periods=int(dollar_vol_min_periods))
+                except Exception:
+                    # Never break flow on an indicator calc issue
+                    df["dollar_vol_avg"] = 0.0
+
+            out[sym] = df
+
+    # Summarize
+    with_data, empty = [], []
+    stale_cut = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
+    stale_syms = []
+
+    for sym in symbols:
+        df = out.get(sym)
+        if df is not None and not df.empty:
+            with_data.append(sym)
+            try:
+                if df.index[-1] < stale_cut:
+                    stale_syms.append(sym)
+            except Exception:
+                pass
+        else:
+            empty.append(sym)
+
+    diag["symbols_with_data"] = with_data
+    diag["symbols_empty"] = empty
+    diag["stale_symbols"] = stale_syms
+
+    _print_json({
+        "type": "BARS_FETCH_SUMMARY",
+        "requested": len(symbols),
+        "with_data": len(with_data),
+        "empty": len(empty),
+        "stale": len(stale_syms),
+        "sample_with_data": with_data[:10],
+        "sample_empty": empty[:10],
+        "when": _now_iso(),
+    })
+
+    # Attach meta (non-symbol key that live loop can optionally print)
+    out["__meta__"] = diag
+    return out
