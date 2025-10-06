@@ -1,25 +1,24 @@
-# === EMAMerged/scripts/live_paper_loop.py ===
 from __future__ import annotations
 import os, sys, json, argparse
 import datetime as dt
 from typing import Dict, List, Any, Optional
 
+import requests  # for reverse-exit API calls
+
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
 from EMAMerged.src.trade_logger import TradeLogger
 from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
-from EMAMerged.src.indicators import atr as _atr, adx_di as _adx_di
+from EMAMerged.src.indicators import atr as _atr
 from EMAMerged.src.data import (
-    fetch_latest_bars,       # dict[symbol] -> DataFrame (Option B dollar_vol)
+    fetch_latest_bars,       # dict[symbol] -> DataFrame
     alpaca_market_open,      # (base_url, key, secret) -> bool
     cancel_all_orders,       # risk ops
     close_all_positions,     # risk ops
     submit_bracket_order,    # order placement
-    close_position,          # per-symbol exit
     get_positions,           # avoid stacking
 )
 
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UTC helpers (tz-aware)
@@ -27,15 +26,11 @@ ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 def now_iso_utc() -> str:
     return dt.datetime.now(dt.UTC).strftime(ISO_UTC)
 
-
 def _utc_stamp(fmt: str) -> str:
     return dt.datetime.now(dt.UTC).strftime(fmt)
 
-
 def _build_cid(symbol: str) -> str:
-    # Preserve prior format with tz-aware now
     return f"EMA_{symbol}_{_utc_stamp('%Y%m%d_%H%M%S')}"
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Broker creds resolution (env first, then config)
@@ -51,32 +46,68 @@ def _resolve_broker(cfg: Dict) -> Dict[str, str]:
     key_id = os.getenv("ALPACA_KEY", key_id)
     secret = os.getenv("ALPACA_SECRET", secret)
 
-    return {"base_url": base_url, "key": key_id, "secret": secret}
-
+    return {"base_url": base_url.rstrip("/"), "key": key_id, "secret": secret}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Time helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def minutes_to_close_et(close_hm: tuple[int, int] = (16, 0)) -> int:
-    """
-    Minutes from 'now' (New York time) until today's regular close (default 16:00 ET).
-    Negative if after close.
-    """
-    now_et = new_york_now()   # timezone-aware
+    now_et = new_york_now()
     close_et = now_et.replace(hour=close_hm[0], minute=close_hm[1], second=0, microsecond=0)
     delta = close_et - now_et
     return int(delta.total_seconds() // 60)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Order/exit helpers (minimal, inline; no data.py churn)
+# ──────────────────────────────────────────────────────────────────────────────
+def _H(broker: Dict[str,str]) -> Dict[str,str]:
+    return {"APCA-API-KEY-ID": broker["key"], "APCA-API-SECRET-KEY": broker["secret"]}
+
+def _list_open_orders_for_symbol(broker: Dict[str,str], symbol: str) -> list[dict]:
+    url = f'{broker["base_url"]}/v2/orders'
+    # nested=false, status=open; 'symbols' filter supported
+    r = requests.get(url, headers=_H(broker), params={"status":"open","symbols":symbol}, timeout=10)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def _cancel_order(broker: Dict[str,str], order_id: str) -> None:
+    url = f'{broker["base_url"]}/v2/orders/{order_id}'
+    try:
+        requests.delete(url, headers=_H(broker), timeout=10)
+    except Exception:
+        pass
+
+def _close_position_market(broker: Dict[str,str], symbol: str) -> dict:
+    """
+    DELETE /v2/positions/{symbol} submits a market order to close the position.
+    We cancel open orders first to avoid OCO conflicts.
+    """
+    # Cancel all open orders for the symbol
+    try:
+        opens = _list_open_orders_for_symbol(broker, symbol)
+        for o in opens:
+            _cancel_order(broker, o.get("id"))
+    except Exception:
+        pass
+
+    url = f'{broker["base_url"]}/v2/positions/{symbol.upper()}'
+    r = requests.delete(url, headers=_H(broker), timeout=15)
+    if r.status_code not in (200, 204):
+        r.raise_for_status()
+    return r.json() if r.text else {}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sizing helpers
+# Sizing helper
 # ──────────────────────────────────────────────────────────────────────────────
 def _cap_qty_by_notional(qty: int, price: float, max_notional: Optional[float]) -> int:
-    if notional := (None if max_notional in (None, 0, "0") else float(max_notional)):
-        max_by_notional = int(max(notional // max(price, 0.01), 0))
-        return max(0, min(qty, max_by_notional))
+    if max_notional not in (None, "", "0"):
+        try:
+            cap = float(max_notional)
+        except Exception:
+            cap = None
+        if cap and price > 0:
+            qty = min(qty, int(max(cap // price, 0)))
     return max(0, qty)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
@@ -98,8 +129,13 @@ def main() -> int:
     rth_only = bool(cfg.get("rth_only", True))
 
     # Risk settings
-    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))                # block NEW entries near close
-    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))  # flatten before close
+    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))
+    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))
+
+    # Exits config (reverse cross)
+    ex_cfg = dict(cfg.get("exits", {}))
+    rv_cfg = dict(ex_cfg.get("reverse_cross", {}))
+    reverse_exit_enabled = bool(rv_cfg.get("enabled", False))
 
     # Broker + market status
     broker = _resolve_broker(cfg)
@@ -110,9 +146,10 @@ def main() -> int:
 
     # Session + heartbeat
     session = "AM" if new_york_now().hour < 12 else "PM"
-    print(json.dumps({"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
-                     separators=(",", ":"), ensure_ascii=False),
-          flush=True)
+    print(json.dumps(
+        {"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
+        separators=(",", ":"), ensure_ascii=False
+    ), flush=True)
 
     if not market_open and not args.force_run:
         return 0
@@ -184,46 +221,34 @@ def main() -> int:
         if df is None or df.empty or len(df) < 3:
             continue
 
-        df = attach_verifiers(df, cfg)
+        df = attach_verifiers(df, cfg)  # adds ema/di/adx/slope/rsi + fresh_cross flags
+
+        # ===== Managed EXIT: reverse-cross on open long =====
+        if reverse_exit_enabled and (sym in pos_map) and float(pos_map[sym].get("qty", 0)) > 0:
+            last = df.iloc[-1]
+            if bool(last.get("fresh_cross_down", False)):
+                if args.dry_run:
+                    print(f"[exit] DRY-RUN REVERSE_CROSS: would close {sym} (fresh bearish cross).", flush=True)
+                else:
+                    try:
+                        resp = _close_position_market(broker, sym)
+                        print(f"[exit] REVERSE_CROSS: closed {sym} → {str(resp)[:280]}", flush=True)
+                    except Exception as e:
+                        print(f"[exit] ERROR closing {sym} on reverse cross: {e}", flush=True)
+                # Skip any new entries for this symbol in same loop
+                continue
+
         last = df.iloc[-1]
 
-        # Cross detection (state-change) and DI trend
-        bull_cross = False
-        bear_cross = False
-        if len(df) >= 2:
-            try:
-                prev_fast = float(df["ema_fast"].iloc[-2])
-                prev_slow = float(df["ema_slow"].iloc[-2])
-                curr_fast = float(df["ema_fast"].iloc[-1])
-                curr_slow = float(df["ema_slow"].iloc[-1])
-                bull_cross = (prev_fast <= prev_slow) and (curr_fast > curr_slow)
-                bear_cross = (prev_fast >= prev_slow) and (curr_fast < curr_slow)
-            except Exception:
-                bull_cross = False
-                bear_cross = False
-
-        # Compute ADX/+DI/-DI for gating (period from config; default 14)
+        # Signal snapshot (for logging)
         try:
-            adx_period = int(cfg.get("adx_period", 14))
-        except Exception:
-            adx_period = 14
-        try:
-            adx_s, plus_di_s, minus_di_s = _adx_di(df, period=adx_period)
-            last_plus_di = float(plus_di_s.iloc[-1])
-            last_minus_di = float(minus_di_s.iloc[-1])
-        except Exception:
-            last_plus_di = None
-            last_minus_di = None
-
-        # Signal snapshot
-        try:
-            cross = 1 if bull_cross else 0
+            cross = 1 if float(last.get("ema_fast", 0.0)) > float(last.get("ema_slow", 0.0)) else 0
         except Exception:
             cross = 0
 
         sig_row = {
             "symbol": sym,
-            "session": session,
+            "session": "AM" if new_york_now().hour < 12 else "PM",
             "cid": _build_cid(sym),
             "tf": timeframe,
             "cross": cross,
@@ -236,32 +261,8 @@ def main() -> int:
         sig_row = {k: v for k, v in sig_row.items() if v is not None}
         log.signal(**sig_row)
 
-        # Managed exit: reverse (bearish) crossover while long
-        rev_cfg = dict(cfg.get("exits", {})).get("reverse_cross", {})
-        if bool(rev_cfg.get("enabled", False)) and sym in pos_map and float(pos_map[sym].get("qty", 0) or 0) > 0:
-            if bear_cross:
-                if args.dry_run:
-                    print(f"[exit] DRY-RUN: reverse-cross exit for {sym} (ema_fast crossed below ema_slow).", flush=True)
-                else:
-                    try:
-                        _ = close_position(broker["base_url"], broker["key"], broker["secret"], symbol=sym)
-                        print(f"[exit] Closed position via reverse cross: {sym}", flush=True)
-                    except Exception as e:
-                        print(f"[exit] ERROR closing {sym} on reverse cross: {e}", flush=True)
-
         # Base gate
         ok, reasons = explain_long_gate(last, cfg)
-
-        # Overlay: require bullish crossover event (state-change) if configured
-        if bool(cfg.get("filters", {}).get("require_cross", False)) and not bull_cross:
-            reasons = list(reasons) + ["no bullish crossover (state-change)"]
-            ok = False
-
-        # Overlay: require +DI > -DI if configured (default True)
-        if bool(cfg.get("filters", {}).get("require_di_trend", True)):
-            if (last_plus_di is None) or (last_minus_di is None) or not (last_plus_di > last_minus_di):
-                reasons = list(reasons) + ["+DI ≤ -DI"]
-                ok = False
 
         # Overlay: entry cutoff
         if not entry_allowed:
@@ -274,7 +275,8 @@ def main() -> int:
             ok = False
 
         # Log gate
-        log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
+        log.gate(symbol=sym, session=sig_row["session"], cid=sig_row["cid"],
+                 decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
 
         # Place order if allowed
         if not ok or not brackets_enabled:
