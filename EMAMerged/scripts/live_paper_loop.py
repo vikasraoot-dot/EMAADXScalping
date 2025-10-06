@@ -2,18 +2,19 @@
 from __future__ import annotations
 import os, sys, json, argparse
 import datetime as dt
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
 from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.filters import attach_verifiers, explain_long_gate
-from EMAMerged.src.indicators import atr as _atr
+from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
+from EMAMerged.src.indicators import atr as _atr, adx_di as _adx_di
 from EMAMerged.src.data import (
     fetch_latest_bars,       # dict[symbol] -> DataFrame (Option B dollar_vol)
     alpaca_market_open,      # (base_url, key, secret) -> bool
     cancel_all_orders,       # risk ops
     close_all_positions,     # risk ops
     submit_bracket_order,    # order placement
+    close_position,          # per-symbol exit
     get_positions,           # avoid stacking
 )
 
@@ -41,7 +42,7 @@ def _build_cid(symbol: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def _resolve_broker(cfg: Dict) -> Dict[str, str]:
     bk = dict(cfg.get("broker", {}))
-    base_url = os.getenv("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))  # noqa: E501
+    base_url = os.getenv("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))
 
     # Primary env names
     key_id = os.getenv("APCA_API_KEY_ID", bk.get("key") or "")
@@ -54,35 +55,16 @@ def _resolve_broker(cfg: Dict) -> Dict[str, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Session time helpers (New York tz)
+# Time helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def _parse_hm(hm: str, fallback: Tuple[int, int]) -> Tuple[int, int]:
-    try:
-        h, m = str(hm).split(":")
-        return int(h), int(m)
-    except Exception:
-        return fallback
-
-
-def minutes_to_close_et(close_hm: Tuple[int, int]) -> int:
+def minutes_to_close_et(close_hm: tuple[int, int] = (16, 0)) -> int:
     """
-    Minutes from 'now' (New York time) until today's regular close (close_hm).
+    Minutes from 'now' (New York time) until today's regular close (default 16:00 ET).
     Negative if after close.
     """
     now_et = new_york_now()   # timezone-aware
     close_et = now_et.replace(hour=close_hm[0], minute=close_hm[1], second=0, microsecond=0)
     delta = close_et - now_et
-    return int(delta.total_seconds() // 60)
-
-
-def minutes_since_open_et(open_hm: Tuple[int, int]) -> int:
-    """
-    Minutes from today's regular open (open_hm) until 'now' (New York time).
-    Negative if before the open.
-    """
-    now_et = new_york_now()
-    open_et = now_et.replace(hour=open_hm[0], minute=open_hm[1], second=0, microsecond=0)
-    delta = now_et - open_et
     return int(delta.total_seconds() // 60)
 
 
@@ -94,65 +76,6 @@ def _cap_qty_by_notional(qty: int, price: float, max_notional: Optional[float]) 
         max_by_notional = int(max(notional // max(price, 0.01), 0))
         return max(0, min(qty, max_by_notional))
     return max(0, qty)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Submit helper with one-shot TP retry for 422 base_price rule
-# ──────────────────────────────────────────────────────────────────────────────
-def _submit_bracket_with_retry(
-    broker: Dict[str, str],
-    symbol: str,
-    qty: int,
-    entry: float,
-    take_profit: float,
-    stop_price: float,
-    tif: str = "day",
-) -> Dict[str, Any]:
-    """
-    Submit bracket; if Alpaca returns a 422 complaining that
-    take_profit.limit_price must be >= base_price + 0.01, retry once by
-    bumping TP to max(tp, base_price + 0.02).
-    """
-    def _ok(resp: Dict[str, Any]) -> bool:
-        return isinstance(resp, dict) and resp.get("id") and not resp.get("code")
-
-    # First attempt (pass-through)
-    resp = submit_bracket_order(
-        broker["base_url"], broker["key"], broker["secret"],
-        symbol=symbol, qty=qty, side="buy",
-        limit_price=None,  # market entry
-        take_profit_price=round(take_profit, 2),
-        stop_loss_price=round(stop_price, 2),
-        tif=tif,
-    )
-    if _ok(resp):
-        return {"status": "ok", "ack": resp, "attempts": 1}
-
-    # Check for the specific 422 TP constraint with base_price
-    msg = (resp.get("message") or "").lower() if isinstance(resp, dict) else ""
-    base_px_raw = (resp.get("base_price") if isinstance(resp, dict) else None)
-    try:
-        base_px = float(base_px_raw) if base_px_raw is not None else None
-    except Exception:
-        base_px = None
-
-    needs_bump = ("take_profit.limit_price must be" in msg) and (base_px is not None)
-    if not needs_bump:
-        return {"status": "error", "ack": resp, "attempts": 1}
-
-    # Bump TP and retry once
-    bumped_tp = round(max(take_profit, base_px + 0.02), 2)
-    resp2 = submit_bracket_order(
-        broker["base_url"], broker["key"], broker["secret"],
-        symbol=symbol, qty=qty, side="buy",
-        limit_price=None,
-        take_profit_price=bumped_tp,
-        stop_loss_price=round(stop_price, 2),
-        tif=tif,
-    )
-    if _ok(resp2):
-        return {"status": "ok", "ack": resp2, "attempts": 2, "tp_bumped_to": bumped_tp, "base_price": base_px}
-    return {"status": "error", "ack": resp2, "attempts": 2, "tp_bumped_to": bumped_tp, "base_price": base_px}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,13 +98,8 @@ def main() -> int:
     rth_only = bool(cfg.get("rth_only", True))
 
     # Risk settings
-    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))                       # block NEW entries near close
-    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))   # flatten before close
-    min_after_open = int(cfg.get("min_minutes_after_open_for_entry", 0))         # optional delay after open
-
-    # Session schedule from config (defaults align with your config.yaml)
-    rth_start_hm = _parse_hm(cfg.get("rth_start", "09:30"), (9, 30))
-    rth_end_hm   = _parse_hm(cfg.get("rth_end",   "15:55"), (15, 55))
+    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))                # block NEW entries near close
+    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))  # flatten before close
 
     # Broker + market status
     broker = _resolve_broker(cfg)
@@ -192,14 +110,9 @@ def main() -> int:
 
     # Session + heartbeat
     session = "AM" if new_york_now().hour < 12 else "PM"
-    print(
-        json.dumps(
-            {"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ),
-        flush=True,
-    )
+    print(json.dumps({"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()},
+                     separators=(",", ":"), ensure_ascii=False),
+          flush=True)
 
     if not market_open and not args.force_run:
         return 0
@@ -210,35 +123,22 @@ def main() -> int:
     log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
 
-    # ── Risk Ops: Flatten window + entry cutoff computation (keep separate reasons)
-    mins_to_close = minutes_to_close_et(rth_end_hm)
-    mtc = max(mins_to_close, 0)
-
-    in_flatten_window = flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close
-    in_cutoff_window = (entry_cutoff_min > 0) and (mins_to_close <= entry_cutoff_min)
-
-    # Optional: delay entries after open (e.g., wait for first 15m bar to close)
-    mins_since_open = minutes_since_open_et(rth_start_hm)
-    in_open_delay = (min_after_open > 0) and (mins_since_open < min_after_open)
-
-    # If inside flatten window: perform risk ops once up front
-    if in_flatten_window:
+    # Risk Ops: Flatten window
+    mins_to_close = minutes_to_close_et((16, 0))
+    if flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close:
         if args.dry_run:
-            print(
-                f"[risk] DRY-RUN: would FLATTEN (cancel orders & close positions) with {mtc} min to close",
-                flush=True,
-            )
+            print(f'[risk] DRY-RUN: would FLATTEN (cancel orders & close positions) with {mins_to_close} min to close', flush=True)
         else:
             try:
-                print(f"[risk] FLATTEN: canceling all orders (mins_to_close={mtc})", flush=True)
+                print(f'[risk] FLATTEN: canceling all orders (mins_to_close={mins_to_close})', flush=True)
                 _ = cancel_all_orders(broker["base_url"], broker["key"], broker["secret"])
-                print(f"[risk] FLATTEN: closing all positions", flush=True)
+                print(f'[risk] FLATTEN: closing all positions', flush=True)
                 _ = close_all_positions(broker["base_url"], broker["key"], broker["secret"])
             except Exception as e:
                 print(f"[risk] ERROR during flatten: {e}", flush=True)
-
-    # Entry is allowed only if NOT in flatten window, NOT in cutoff window, and NOT in open delay
-    entry_allowed = not (in_flatten_window or in_cutoff_window or in_open_delay)
+        entry_allowed = False
+    else:
+        entry_allowed = (mins_to_close > entry_cutoff_min) if entry_cutoff_min > 0 else True
 
     # Pull bars (Option B) — rolling params from config.filters
     fcfg = dict(cfg.get("filters", {}))
@@ -260,7 +160,7 @@ def main() -> int:
     )
 
     # Current positions (avoid stacking)
-    pos_map: Dict[str, Dict[str, Any]] = {}
+    pos_map = {}
     try:
         pos_map = get_positions(broker["base_url"], broker["key"], broker["secret"]) or {}
     except Exception:
@@ -287,9 +187,37 @@ def main() -> int:
         df = attach_verifiers(df, cfg)
         last = df.iloc[-1]
 
+        # Cross detection (state-change) and DI trend
+        bull_cross = False
+        bear_cross = False
+        if len(df) >= 2:
+            try:
+                prev_fast = float(df["ema_fast"].iloc[-2])
+                prev_slow = float(df["ema_slow"].iloc[-2])
+                curr_fast = float(df["ema_fast"].iloc[-1])
+                curr_slow = float(df["ema_slow"].iloc[-1])
+                bull_cross = (prev_fast <= prev_slow) and (curr_fast > curr_slow)
+                bear_cross = (prev_fast >= prev_slow) and (curr_fast < curr_slow)
+            except Exception:
+                bull_cross = False
+                bear_cross = False
+
+        # Compute ADX/+DI/-DI for gating (period from config; default 14)
+        try:
+            adx_period = int(cfg.get("adx_period", 14))
+        except Exception:
+            adx_period = 14
+        try:
+            adx_s, plus_di_s, minus_di_s = _adx_di(df, period=adx_period)
+            last_plus_di = float(plus_di_s.iloc[-1])
+            last_minus_di = float(minus_di_s.iloc[-1])
+        except Exception:
+            last_plus_di = None
+            last_minus_di = None
+
         # Signal snapshot
         try:
-            cross = 1 if float(last.get("ema_fast", 0.0)) > float(last.get("ema_slow", 0.0)) else 0
+            cross = 1 if bull_cross else 0
         except Exception:
             cross = 0
 
@@ -308,18 +236,36 @@ def main() -> int:
         sig_row = {k: v for k, v in sig_row.items() if v is not None}
         log.signal(**sig_row)
 
+        # Managed exit: reverse (bearish) crossover while long
+        rev_cfg = dict(cfg.get("exits", {})).get("reverse_cross", {})
+        if bool(rev_cfg.get("enabled", False)) and sym in pos_map and float(pos_map[sym].get("qty", 0) or 0) > 0:
+            if bear_cross:
+                if args.dry_run:
+                    print(f"[exit] DRY-RUN: reverse-cross exit for {sym} (ema_fast crossed below ema_slow).", flush=True)
+                else:
+                    try:
+                        _ = close_position(broker["base_url"], broker["key"], broker["secret"], symbol=sym)
+                        print(f"[exit] Closed position via reverse cross: {sym}", flush=True)
+                    except Exception as e:
+                        print(f"[exit] ERROR closing {sym} on reverse cross: {e}", flush=True)
+
         # Base gate
         ok, reasons = explain_long_gate(last, cfg)
 
-        # Overlay: session close guards and open delay (use precise reasons)
-        if ok and in_flatten_window:
-            reasons = list(reasons) + [f"flatten_minutes_before_close: {max(mtc,0)} min to close <= {flatten_min_before_close}"]
+        # Overlay: require bullish crossover event (state-change) if configured
+        if bool(cfg.get("filters", {}).get("require_cross", False)) and not bull_cross:
+            reasons = list(reasons) + ["no bullish crossover (state-change)"]
             ok = False
-        elif ok and in_cutoff_window:
-            reasons = list(reasons) + [f"entry_cutoff_min: {max(mtc,0)} min to close <= {entry_cutoff_min}"]
-            ok = False
-        elif ok and in_open_delay:
-            reasons = list(reasons) + [f"wait_for_first_bar: {mins_since_open} min since open < {min_after_open}"]
+
+        # Overlay: require +DI > -DI if configured (default True)
+        if bool(cfg.get("filters", {}).get("require_di_trend", True)):
+            if (last_plus_di is None) or (last_minus_di is None) or not (last_plus_di > last_minus_di):
+                reasons = list(reasons) + ["+DI ≤ -DI"]
+                ok = False
+
+        # Overlay: entry cutoff
+        if not entry_allowed:
+            reasons = list(reasons) + [f"entry_cutoff_min: {max(mins_to_close, 0)} min to close"]
             ok = False
 
         # Avoid stacking: if already long, block new
@@ -328,13 +274,7 @@ def main() -> int:
             ok = False
 
         # Log gate
-        log.gate(
-            symbol=sym,
-            session=session,
-            cid=sig_row["cid"],
-            decision=("ALLOW" if ok else "BLOCK"),
-            reasons=reasons,
-        )
+        log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
 
         # Place order if allowed
         if not ok or not brackets_enabled:
@@ -368,29 +308,21 @@ def main() -> int:
             continue
 
         if args.dry_run:
-            print(
-                f"[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} "
-                f"sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})",
-                flush=True,
-            )
+            print(f'[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} '
+                  f'sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})', flush=True)
         else:
-            ack = _submit_bracket_with_retry(
-                broker=broker,
-                symbol=sym,
-                qty=qty,
-                entry=entry,
-                take_profit=take_profit,
-                stop_price=stop_price,
-                tif="day",
-            )
-            # Friendly logging for both paths
-            if ack.get("status") == "ok":
-                extra = ""
-                if "tp_bumped_to" in ack:
-                    extra = f" (TP bumped to {ack['tp_bumped_to']:.2f} vs base_price {ack.get('base_price')})"
-                print(f"[order] BRACKET submitted for {sym}: {json.dumps(ack['ack'])[:300]}{extra}", flush=True)
-            else:
-                print(f"[order] ERROR submitting bracket for {sym}: {json.dumps(ack.get('ack', {}))[:500]}", flush=True)
+            try:
+                resp = submit_bracket_order(
+                    broker["base_url"], broker["key"], broker["secret"],
+                    symbol=sym, qty=qty, side="buy",
+                    limit_price=None,  # market entry
+                    take_profit_price=take_profit,
+                    stop_loss_price=stop_price,
+                    tif="day",
+                )
+                print(f"[order] BRACKET submitted for {sym}: {json.dumps(resp)[:300]}", flush=True)
+            except Exception as e:
+                print(f"[order] ERROR submitting bracket for {sym}: {e}", flush=True)
 
     try:
         log.close()
