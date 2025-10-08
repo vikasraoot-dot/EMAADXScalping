@@ -173,8 +173,12 @@ def main() -> int:
     log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
 
-    # Broker creds (for market/positions/order calls)
+    # Broker creds (for market/positions/order calls) + set env for Market Data
     base_url, key, secret = _broker_creds(cfg)
+    # Ensure data helpers that rely on env headers are authenticated
+    if key and secret:
+        os.environ["APCA_API_KEY_ID"] = key
+        os.environ["APCA_API_SECRET_KEY"] = secret
 
     # Universe
     symbols = load_symbols_from_file(args.tickers)
@@ -214,12 +218,51 @@ def main() -> int:
         ),
         flush=True,
     )
-    bars_map, bars_meta = fetch_latest_bars(symbols, timeframe, history_days, feed)
+
+    res = None
+    try:
+        res = fetch_latest_bars(symbols, timeframe, history_days, feed)
+    except Exception as e:
+        # Hard failure from the data helper
+        print(
+            json.dumps(
+                {
+                    "type": "BARS_FETCH_ERROR",
+                    "reason": "exception",
+                    "message": str(e),
+                    "timeframe": timeframe,
+                    "feed": feed,
+                    "when": now_utc.isoformat(),
+                }
+            ),
+            flush=True,
+        )
+        return 1
+
+    # Defensive unpack (some implementations return None on 401 etc.)
+    if not isinstance(res, tuple) or len(res) != 2:
+        print(
+            json.dumps(
+                {
+                    "type": "BARS_FETCH_ERROR",
+                    "reason": "no_result",
+                    "message": "fetch_latest_bars returned no data",
+                    "timeframe": timeframe,
+                    "feed": feed,
+                    "when": now_utc.isoformat(),
+                }
+            ),
+            flush=True,
+        )
+        return 1
+
+    bars_map, bars_meta = res
 
     # Summary
     with_data = sorted([s for s, d in bars_map.items() if isinstance(d, pd.DataFrame) and not d.empty])
     empty = sorted(list(set(symbols) - set(with_data)))
-    stale = sorted(list(bars_meta.get("stale_symbols", [])))
+    stale = sorted(list((bars_meta or {}).get("stale_symbols", [])))
+    http_errors = (bars_meta or {}).get("http_errors", [])
 
     print(
         json.dumps(
@@ -244,7 +287,7 @@ def main() -> int:
                 "timeframe": timeframe,
                 "history_days": history_days,
                 "feed": feed,
-                "http_errors": bars_meta.get("http_errors", []),
+                "http_errors": http_errors,
                 "symbols_with_data": with_data,
                 "symbols_empty": empty,
                 "stale_symbols": stale,
@@ -253,6 +296,7 @@ def main() -> int:
         ),
         flush=True,
     )
+
     # Snapshot
     snap = []
     for s in symbols[:50]:
@@ -277,7 +321,6 @@ def main() -> int:
 
     # Risk knobs
     brackets = cfg.get("brackets", {}) or {}
-    # breakeven = cfg.get("breakeven", {}) or {}  # (not used here)
 
     # Size guard
     base_qty = int(cfg.get("qty", 1))
