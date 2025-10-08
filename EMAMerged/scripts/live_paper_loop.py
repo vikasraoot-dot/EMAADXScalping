@@ -1,4 +1,4 @@
-we#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Live loop (paper): EMA + ADX + DI filters, bracket orders.
