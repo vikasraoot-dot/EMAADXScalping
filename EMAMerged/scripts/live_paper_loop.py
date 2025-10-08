@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+we#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Live loop (paper): EMA + ADX + DI filters, bracket orders.
@@ -139,8 +139,12 @@ def main() -> int:
     # Logger
     results_dir = cfg.get("results_dir", "results")
     os.makedirs(results_dir, exist_ok=True)
-    log = TradeLogger(results_dir, session_label=session)
-
+    # Logger
+    results_dir = cfg.get("results_dir", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
+    log = TradeLogger(log_path)
+    
     # Universe
     symbols = load_symbols_from_file(args.tickers)
 
