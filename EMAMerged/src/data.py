@@ -8,6 +8,21 @@ import pandas as pd
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Back-compat shim for older callers
+# ──────────────────────────────────────────────────────────────────────────────
+def load_symbols_from_file(path: str) -> list[str]:
+    """
+    Compatibility wrapper used by some scripts.
+    Delegates to EMAMerged.src.utils.read_tickers.
+    """
+    try:
+        from EMAMerged.src.utils import read_tickers
+        return read_tickers(path)
+    except Exception:
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Small time helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _now_utc() -> dt.datetime:
