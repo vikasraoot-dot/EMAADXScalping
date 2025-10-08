@@ -95,11 +95,37 @@ def _pretty_timeframe(tf: str) -> str:
 def _broker_creds(cfg: dict) -> tuple[str, str, str]:
     """Pull broker creds from config or environment, with safe defaults."""
     broker = cfg.get("broker", {}) or {}
-    base_url = broker.get("base_url") or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-    # Support both env name variants
+    base_url = broker.get("base_url") or os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL") or ""
     key = broker.get("key") or os.getenv("ALPACA_KEY_ID") or os.getenv("APCA_API_KEY_ID") or ""
     secret = broker.get("secret") or os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY") or ""
     return base_url, key, secret
+
+
+def _force_paper_base_url(base_url: str, now_iso: str) -> str:
+    """Return paper trading URL, emitting a SAFETY log if we override a live URL."""
+    paper = "https://paper-api.alpaca.markets"
+    if not base_url:
+        # No URL configured; default to paper.
+        print(json.dumps({
+            "type": "SAFETY",
+            "action": "default_base_url_to_paper",
+            "now": paper,
+            "when": now_iso
+        }), flush=True)
+        return paper
+
+    if "paper-api.alpaca.markets" in base_url:
+        return paper
+
+    # Looks like a live endpoint (api.alpaca.markets or something else) -> override.
+    print(json.dumps({
+        "type": "SAFETY",
+        "action": "override_base_url_to_paper",
+        "was": base_url,
+        "now": paper,
+        "when": now_iso
+    }), flush=True)
+    return paper
 
 
 def _alpaca_market_open_compat(base_url: str, key: str, secret: str) -> bool:
@@ -164,6 +190,7 @@ def main() -> int:
     rth_start = cfg.get("rth_start", "09:30")
     rth_end = cfg.get("rth_end", "15:55")
     now_utc = _now_utc()
+    now_iso = now_utc.isoformat()
     now_et = now_utc.astimezone(tz)
     session = _session_label(now_et, rth_start, rth_end)
 
@@ -173,33 +200,32 @@ def main() -> int:
     log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
 
-    # Broker creds (for market/positions/order calls) + set env for Market Data
-    base_url, key, secret = _broker_creds(cfg)
-    # Ensure data helpers that rely on env headers are authenticated
-    if key and secret:
+    # Broker creds (for market/positions/order calls)
+    base_url_raw, key, secret = _broker_creds(cfg)
+    base_url = _force_paper_base_url(base_url_raw, now_iso)
+
+    # Ensure SDKs/helpers that read env use **paper** and correct keys
+    os.environ["APCA_API_BASE_URL"] = base_url
+    if key:
         os.environ["APCA_API_KEY_ID"] = key
+    if secret:
         os.environ["APCA_API_SECRET_KEY"] = secret
 
     # Universe
     symbols = load_symbols_from_file(args.tickers)
-    print(
-        json.dumps(
-            {"type": "UNIVERSE", "loaded": len(symbols), "sample": symbols[:10], "when": now_utc.isoformat()}
-        ),
-        flush=True,
-    )
+    print(json.dumps({"type": "UNIVERSE", "loaded": len(symbols), "sample": symbols[:10], "when": now_iso}), flush=True)
 
     # Entry windows?
     windows = cfg.get("entry_windows", [])
     if not _in_entry_window(now_et, windows):
-        print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_utc.isoformat()}))
+        print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_iso}))
         return 0
 
     # Market open check (paper)
     if not _alpaca_market_open_compat(base_url, key, secret):
-        print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": False, "ts": now_utc.isoformat()}))
+        print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": False, "ts": now_iso}))
         return 0
-    print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_utc.isoformat()}))
+    print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_iso}))
 
     # Fetch bars  (NOTE: function expects (symbols, timeframe, history_days, feed))
     feed = cfg.get("feed", "iex")
@@ -212,8 +238,8 @@ def main() -> int:
                 "timeframe": timeframe,
                 "feed": feed,
                 "start": (now_utc - timedelta(days=history_days)).isoformat(),
-                "end": now_utc.isoformat(),
-                "when": now_utc.isoformat(),
+                "end": now_iso,
+                "when": now_iso,
             }
         ),
         flush=True,
@@ -232,7 +258,7 @@ def main() -> int:
                     "message": str(e),
                     "timeframe": timeframe,
                     "feed": feed,
-                    "when": now_utc.isoformat(),
+                    "when": now_iso,
                 }
             ),
             flush=True,
@@ -249,7 +275,7 @@ def main() -> int:
                     "message": "fetch_latest_bars returned no data",
                     "timeframe": timeframe,
                     "feed": feed,
-                    "when": now_utc.isoformat(),
+                    "when": now_iso,
                 }
             ),
             flush=True,
@@ -274,7 +300,7 @@ def main() -> int:
                 "stale": len(stale),
                 "sample_with_data": with_data[:4],
                 "sample_empty": empty[:10],
-                "when": now_utc.isoformat(),
+                "when": now_iso,
             }
         ),
         flush=True,
@@ -291,7 +317,7 @@ def main() -> int:
                 "symbols_with_data": with_data,
                 "symbols_empty": empty,
                 "stale_symbols": stale,
-                "when": now_utc.isoformat(),
+                "when": now_iso,
             }
         ),
         flush=True,
@@ -430,6 +456,8 @@ def main() -> int:
             continue
 
         # Size
+        base_qty = int(cfg.get("qty", 1))
+        max_shares = int(cfg.get("max_shares_per_trade", base_qty))
         qty = max(1, min(base_qty, max_shares))
         qty = _cap_qty_by_notional(qty, entry, max_notional)
         if qty < 1:
