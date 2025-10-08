@@ -11,10 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -36,8 +34,14 @@ from EMAMerged.src.indicators import (
 from EMAMerged.src.trade_logger import TradeLogger
 
 
+# -------- helpers --------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc_stamp(fmt: str = "%Y%m%d") -> str:
+    # used for log filename (e.g., live_20251007.jsonl)
+    return datetime.now(timezone.utc).strftime(fmt)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -117,6 +121,7 @@ def attach_verifiers(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return df
 
 
+# -------- main --------
 def main() -> int:
     args = _parse_args()
     cfg = _load_config(args.config)
@@ -139,15 +144,11 @@ def main() -> int:
     # Logger
     results_dir = cfg.get("results_dir", "results")
     os.makedirs(results_dir, exist_ok=True)
-    # Logger
-    results_dir = cfg.get("results_dir", "results")
-    os.makedirs(results_dir, exist_ok=True)
     log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
-    
+
     # Universe
     symbols = load_symbols_from_file(args.tickers)
-
     print(
         json.dumps(
             {"type": "UNIVERSE", "loaded": len(symbols), "sample": symbols[:10], "when": now_utc.isoformat()}
@@ -245,7 +246,7 @@ def main() -> int:
 
     # Risk knobs
     brackets = cfg.get("brackets", {}) or {}
-    breakeven = cfg.get("breakeven", {}) or {}
+    # breakeven = cfg.get("breakeven", {}) or {}  # (not used here)
 
     # Size guard
     allow_shorts = bool(cfg.get("allow_shorts", False))  # long-only here
@@ -262,7 +263,6 @@ def main() -> int:
 
         df = attach_verifiers(df, cfg)
         last = df.iloc[-1]
-        prev = df.iloc[-2]
 
         # Build signal row
         cross_up = bool(last["fresh_cross_up"])
