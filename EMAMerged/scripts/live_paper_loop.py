@@ -1,188 +1,249 @@
-# === EMAMerged/scripts/live_paper_loop.py ===
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Live loop (paper): EMA + ADX + DI filters, bracket orders.
+- Normalizes 15m strategy, scans on a 5m cadence.
+- Writes compact JSONL results via TradeLogger.
+"""
+
 from __future__ import annotations
 
-import os, sys, json, argparse
-import datetime as dt
-from typing import Dict, List, Any, Optional
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-from EMAMerged.src.utils import load_config, read_tickers, new_york_now, round2
-from EMAMerged.src.trade_logger import TradeLogger
-from EMAMerged.src.filters import attach_verifiers, explain_long_gate, long_ok
-from EMAMerged.src.indicators import atr as _atr
+import numpy as np
+import pandas as pd
+
+# Local imports
 from EMAMerged.src.data import (
-    fetch_latest_bars,       # dict[symbol] -> DataFrame (+ "__meta__")
-    alpaca_market_open,      # (base_url, key, secret) -> bool
-    cancel_all_orders,       # risk ops
-    close_all_positions,     # risk ops
-    submit_bracket_order,    # order placement
-    get_positions,           # avoid stacking
+    load_symbols_from_file,
+    fetch_latest_bars,
+    alpaca_market_open,
+    submit_bracket_order,
+    get_positions,
 )
+from EMAMerged.src.indicators import (
+    ta_add_emas,
+    ta_add_rsi,
+    ta_add_adx_di,
+    ta_add_vol_dollar,
+)
+from EMAMerged.src.trade_logger import TradeLogger
 
-ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 
-def now_iso_utc() -> str:
-    return dt.datetime.now(dt.UTC).strftime(ISO_UTC)
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _utc_stamp(fmt: str) -> str:
-    return dt.datetime.now(dt.UTC).strftime(fmt)
 
-def _build_cid(symbol: str) -> str:
-    return f"EMA_{symbol}_{_utc_stamp('%Y%m%d_%H%M%S')}"
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", required=True)
+    p.add_argument("--tickers", required=True)
+    p.add_argument("--dry-run", type=int, default=0)
+    p.add_argument("--force-run", type=int, default=0)
+    return p.parse_args()
 
-def _print_json(obj: Dict[str, Any]) -> None:
-    try:
-        print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False), flush=True)
-    except Exception:
-        pass
 
-# ---------------------------------------------------------------------
-# Broker creds resolution (env first, then config)
-# ---------------------------------------------------------------------
-def _resolve_broker(cfg: Dict) -> Dict[str, str]:
-    bk = dict(cfg.get("broker", {}))
-    base_url = os.getenv("APCA_BASE_URL", bk.get("base_url", "https://paper-api.alpaca.markets"))
+def _load_config(path: str) -> dict:
+    import yaml
 
-    key_id = os.getenv("APCA_API_KEY_ID", bk.get("key") or "")
-    secret = os.getenv("APCA_API_SECRET_KEY", bk.get("secret") or "")
-    key_id = os.getenv("ALPACA_KEY", key_id)       # back-compat
-    secret = os.getenv("ALPACA_SECRET", secret)    # back-compat
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-    return {"base_url": base_url.rstrip("/"), "key": key_id, "secret": secret}
 
-# ---------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------
-def minutes_to_close_et(close_hm: tuple[int, int] = (16, 0)) -> int:
-    now_et = new_york_now()
-    close_et = now_et.replace(hour=close_hm[0], minute=close_hm[1], second=0, microsecond=0)
-    delta = close_et - now_et
-    return int(delta.total_seconds() // 60)
+def _session_label(now_et: datetime, rth_start: str, rth_end: str) -> str:
+    # AM = from open to 12:30, PM = 12:30 -> close (just a label for logs)
+    hhmm = now_et.strftime("%H:%M")
+    return "AM" if hhmm < "12:30" else "PM"
 
-# ---------------------------------------------------------------------
-# Sizing helpers
-# ---------------------------------------------------------------------
-def _cap_qty_by_notional(qty: int, price: float, max_notional: Optional[float]) -> int:
-    if max_notional in (None, 0, "0", "", "None"):
-        return max(0, int(qty))
-    try:
-        cap = float(max_notional)
-        max_by_notional = int(max(cap // max(price, 0.01), 0))
-        return max(0, min(int(qty), max_by_notional))
-    except Exception:
-        return max(0, int(qty))
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--tickers", required=True)
-    ap.add_argument("--dry-run", type=int, default=1)
-    ap.add_argument("--force-run", type=int, default=0)
-    args = ap.parse_args()
+def _in_entry_window(now_et: datetime, windows: List[dict]) -> bool:
+    if not windows:
+        return True
+    hhmm = now_et.strftime("%H:%M")
+    for w in windows:
+        if w["start"] <= hhmm <= w["end"]:
+            return True
+    return False
 
-    cfg = load_config(args.config)
 
-    timeframe = cfg.get("timeframe", "15Min")
-    history_days = int(cfg.get("history_days", 10))
-    feed = cfg.get("feed", "iex")
-    rth_only = bool(cfg.get("rth_only", True))
-
-    # Risk settings
-    entry_cutoff_min = int(cfg.get("entry_cutoff_min", 0))
-    flatten_min_before_close = int(cfg.get("flatten_minutes_before_close", 0))
-
-    # Broker + market status
-    broker = _resolve_broker(cfg)
-    market_open = alpaca_market_open(broker["base_url"], broker["key"], broker["secret"])
-
-    # Tickers
-    symbols = read_tickers(args.tickers)
-    _print_json({"type": "UNIVERSE", "loaded": len(symbols), "sample": symbols[:10], "when": now_iso_utc()})
-
-    # Session + heartbeat
-    session = "AM" if new_york_now().hour < 12 else "PM"
-    _print_json({"session": session, "market_open": bool(market_open), "type": "HEARTBEAT", "ts": now_iso_utc()})
-
-    if not market_open and not args.force_run:
+def _cap_qty_by_notional(qty: int, entry: float, max_notional: float | None) -> int:
+    if not max_notional:
+        return qty
+    if entry <= 0:
         return 0
+    return min(qty, int(max_notional // entry))
+
+
+def _pretty_timeframe(tf: str) -> str:
+    # normalize like "15m" -> "15Min"
+    tf = tf.strip()
+    if tf.endswith("m"):
+        return f"{tf[:-1]}Min"
+    return tf
+
+
+def attach_verifiers(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Append all indicators + helper columns used by gates.
+    """
+    df = df.copy()
+    fast = int(cfg.get("ema_fast", 9))
+    slow = int(cfg.get("ema_slow", 21))
+    rsi_len = int(cfg.get("rsi_length", cfg.get("filters", {}).get("rsi_period", 14)))
+    adx_per = int(cfg.get("adx_period", 14))
+    vol_win = int(cfg.get("vol_sma_length", 10))
+
+    df = ta_add_emas(df, fast, slow)
+    df = ta_add_rsi(df, rsi_len)
+    df = ta_add_adx_di(df, adx_per)
+    df = ta_add_vol_dollar(df, vol_win)
+
+    # Helpers for slope and fresh cross
+    df["ema_fast_slope_pct"] = df["ema_fast"].pct_change()
+    df["fresh_cross_up"] = (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)) & (
+        df["ema_fast"] > df["ema_slow"]
+    )
+    df["fresh_cross_down"] = (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1)) & (
+        df["ema_fast"] < df["ema_slow"]
+    )
+    # Directional trend gate
+    df["+DI_gt_-DI"] = df["+DI"] > df["-DI"]
+    return df
+
+
+def main() -> int:
+    args = _parse_args()
+    cfg = _load_config(args.config)
+
+    # Reference timeframe
+    intervals = cfg.get("intervals") or ["15m"]
+    timeframe = _pretty_timeframe(intervals[0])  # "15Min"
+    history_days = int(cfg.get("history_days", 30))
+
+    # Session clock
+    import pytz
+
+    tz = pytz.timezone(cfg.get("timezone", "US/Eastern"))
+    rth_start = cfg.get("rth_start", "09:30")
+    rth_end = cfg.get("rth_end", "15:55")
+    now_utc = _now_utc()
+    now_et = now_utc.astimezone(tz)
+    session = _session_label(now_et, rth_start, rth_end)
 
     # Logger
     results_dir = cfg.get("results_dir", "results")
     os.makedirs(results_dir, exist_ok=True)
-    log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
-    log = TradeLogger(log_path)
+    log = TradeLogger(results_dir, session_label=session)
 
-    # Risk Ops: Flatten window
-    mins_to_close = minutes_to_close_et((16, 0))
-    entry_allowed = True
-    if flatten_min_before_close > 0 and mins_to_close <= flatten_min_before_close:
-        if args.dry_run:
-            print(f'[risk] DRY-RUN: would FLATTEN (cancel orders & close positions) with {mins_to_close} min to close', flush=True)
-        else:
-            try:
-                print(f'[risk] FLATTEN: canceling all orders (mins_to_close={mins_to_close})', flush=True)
-                _ = cancel_all_orders(broker["base_url"], broker["key"], broker["secret"])
-                print(f'[risk] FLATTEN: closing all positions', flush=True)
-                _ = close_all_positions(broker["base_url"], broker["key"], broker["secret"])
-            except Exception as e:
-                print(f"[risk] ERROR during flatten: {e}", flush=True)
-        entry_allowed = False
-    else:
-        entry_allowed = (mins_to_close > entry_cutoff_min) if entry_cutoff_min > 0 else True
+    # Universe
+    symbols = load_symbols_from_file(args.tickers)
 
-    # Pull bars with diagnostics
-    fcfg = dict(cfg.get("filters", {}))
-    bars_map = fetch_latest_bars(
-        symbols,
-        timeframe=timeframe,
-        history_days=history_days,
-        feed=feed,
-        rth_only=rth_only,
-        tz_name=cfg.get("timezone", "US/Eastern"),
-        rth_start=cfg.get("rth_start", "09:30"),
-        rth_end=cfg.get("rth_end", "15:55"),
-        allowed_windows=cfg.get("entry_windows"),
-        bar_limit=int(cfg.get("bar_limit", 10000)),
-        key=broker["key"],
-        secret=broker["secret"],
-        dollar_vol_window=int(fcfg.get("dollar_vol_window", 20)),
-        dollar_vol_min_periods=int(fcfg.get("dollar_vol_min_periods", 7)),
+    print(
+        json.dumps(
+            {"type": "UNIVERSE", "loaded": len(symbols), "sample": symbols[:10], "when": now_utc.isoformat()}
+        ),
+        flush=True,
     )
 
-    # If data.py attached a meta diagnostics block, surface it once
-    if isinstance(bars_map, dict) and "__meta__" in bars_map:
-        meta = dict(bars_map["__meta__"])
-        meta.pop("chunks", None)  # chunks are already logged by data.py
-        _print_json({"type": "BARS_META", **meta})
+    # Entry windows?
+    windows = cfg.get("entry_windows", [])
+    if not _in_entry_window(now_et, windows):
+        print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_utc.isoformat()}))
+        return 0
 
-    # Quick per-symbol snapshot (compact): did we get bars and what's the last ts?
-    snapshot = []
-    for s in symbols[:50]:  # cap to avoid giant lines
+    # Market open check (paper)
+    if not alpaca_market_open():
+        print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": False, "ts": now_utc.isoformat()}))
+        return 0
+    print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_utc.isoformat()}))
+
+    # Fetch bars
+    print(
+        json.dumps(
+            {
+                "type": "BARS_FETCH_START",
+                "requested": len(symbols),
+                "chunks": 2,
+                "timeframe": timeframe,
+                "feed": cfg.get("feed", "iex"),
+                "start": (now_utc - timedelta(days=history_days)).isoformat(),
+                "end": now_utc.isoformat(),
+                "when": now_utc.isoformat(),
+            }
+        ),
+        flush=True,
+    )
+    bars_map, bars_meta = fetch_latest_bars(symbols, history_days, timeframe, cfg.get("feed", "iex"))
+
+    # Summary
+    with_data = sorted([s for s, d in bars_map.items() if isinstance(d, pd.DataFrame) and not d.empty])
+    empty = sorted(list(set(symbols) - set(with_data)))
+    stale = sorted(list(bars_meta.get("stale_symbols", [])))
+
+    print(
+        json.dumps(
+            {
+                "type": "BARS_FETCH_SUMMARY",
+                "requested": len(symbols),
+                "with_data": len(with_data),
+                "empty": len(empty),
+                "stale": len(stale),
+                "sample_with_data": with_data[:4],
+                "sample_empty": empty[:10],
+                "when": now_utc.isoformat(),
+            }
+        ),
+        flush=True,
+    )
+    print(
+        json.dumps(
+            {
+                "type": "BARS_FETCH",
+                "requested": len(symbols),
+                "timeframe": timeframe,
+                "history_days": history_days,
+                "feed": cfg.get("feed", "iex"),
+                "http_errors": bars_meta.get("http_errors", []),
+                "symbols_with_data": with_data,
+                "symbols_empty": empty,
+                "stale_symbols": stale,
+                "when": now_utc.isoformat(),
+            }
+        ),
+        flush=True,
+    )
+    # Snapshot
+    snap = []
+    for s in symbols[:50]:
         df = bars_map.get(s)
-        if df is None or df.empty:
-            snapshot.append({"s": s, "ok": False})
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            snap.append({"s": s, "ok": True, "last": str(df.index[-1])})
         else:
-            try:
-                snapshot.append({"s": s, "ok": True, "last": str(df.index[-1])})
-            except Exception:
-                snapshot.append({"s": s, "ok": True})
-    _print_json({"type": "BARS_SNAPSHOT", "sample": snapshot, "when": now_iso_utc()})
+            snap.append({"s": s, "ok": False})
+    print(json.dumps({"type": "BARS_SNAPSHOT", "sample": snap[:50]}), flush=True)
 
-    # Current positions (avoid stacking)
-    try:
-        pos_map = get_positions(broker["base_url"], broker["key"], broker["secret"]) or {}
-    except Exception:
-        pos_map = {}
+    # Current positions (for "already in position" gate)
+    positions = {p["symbol"]: p for p in get_positions() or []}
 
-    # Bracket configuration
-    br_cfg = dict(cfg.get("brackets", {}))
-    brackets_enabled = bool(br_cfg.get("enabled", True))
-    atr_mult_sl = float(br_cfg.get("atr_mult_sl", 1.2))
-    tp_r = float(br_cfg.get("take_profit_r", 1.8))
-    tick_size = float(cfg.get("breakeven", {}).get("tick_size", 0.01))  # reuse for min-tick guard
+    # Filters
+    fcfg = cfg.get("filters", {}) or {}
+    adx_threshold = float(fcfg.get("adx_threshold", 23.0))
+    rsi_min = float(fcfg.get("rsi_min", 50))
+    rsi_max = float(fcfg.get("rsi_max", 80))
+    slope_thr = float(fcfg.get("slope_threshold_pct", 0.0010))
+    require_fast_above_slow = bool(fcfg.get("require_fast_above_slow", True))
 
+    # Risk knobs
+    brackets = cfg.get("brackets", {}) or {}
+    breakeven = cfg.get("breakeven", {}) or {}
+
+    # Size guard
     allow_shorts = bool(cfg.get("allow_shorts", False))  # long-only here
     base_qty = int(cfg.get("qty", 1))
     max_shares = int(cfg.get("max_shares_per_trade", base_qty))
@@ -197,87 +258,166 @@ def main() -> int:
 
         df = attach_verifiers(df, cfg)
         last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        # Signal snapshot
-        try:
-            cross_now = float(last.get("ema_fast", 0.0)) > float(last.get("ema_slow", 0.0))
-        except Exception:
-            cross_now = False
+        # Build signal row
+        cross_up = bool(last["fresh_cross_up"])
+        ema_ok = bool(last["ema_fast"] > last["ema_slow"])
+        di_ok = bool(last["+DI_gt_-DI"])
+        adx_val = float(last["ADX"]) if not pd.isna(last["ADX"]) else np.nan
+        rsi_val = float(last["rsi"]) if not pd.isna(last["rsi"]) else np.nan
+        slope = float(last["ema_fast_slope_pct"]) if not pd.isna(last["ema_fast_slope_pct"]) else 0.0
 
         sig_row = {
             "symbol": sym,
             "session": session,
-            "cid": _build_cid(sym),
+            "cid": f"EMA_{sym}_{now_utc.strftime('%Y%m%d_%H%M%S')}",
             "tf": timeframe,
-            "cross": 1 if cross_now else 0,
+            "cross": 1 if cross_up else 0,
             "ref_bar_ts": str(df.index[-1]),
-            "last_close": float(last.get("close", 0.0)),
-            "adx": float(last.get("adx", 0.0)),
-            "ema_slope_pct": float(last.get("ema_slope_pct", 0.0)),
-            "rsi": float(last.get("rsi", 50.0)) if "rsi" in df.columns else None,
+            "last_close": float(last["close"]),
+            "adx": float(adx_val) if not np.isnan(adx_val) else None,
+            "ema_slope_pct": slope,
+            "rsi": float(rsi_val) if not np.isnan(rsi_val) else None,
         }
-        sig_row = {k: v for k, v in sig_row.items() if v is not None}
         log.signal(**sig_row)
 
-        # Base gate
-        ok, reasons = explain_long_gate(last, cfg)
+        # Gate
+        reasons = []
+        if require_fast_above_slow and not ema_ok:
+            reasons.append("ema_fast ≤ ema_slow")
+        if cross_up is False:
+            reasons.append("no fresh cross (fast>slow)")
+        if not di_ok:
+            reasons.append("+DI ≤ -DI (trend mismatch)")
+        if not np.isnan(adx_val) and adx_val < adx_threshold:
+            reasons.append(f"ADX {adx_val:.1f} < {adx_threshold:.1f}")
+        if rsi_val < rsi_min:
+            reasons.append(f"RSI {rsi_val:.1f} < {rsi_min:.1f}")
+        if rsi_val > rsi_max:
+            reasons.append(f"RSI {rsi_val:.1f} > {rsi_max:.1f}")
+        if slope < slope_thr:
+            reasons.append(f"EMA_slope {slope:.5f} < {slope_thr:.5f}")
 
-        # Overlay: entry cutoff and existing position
-        if not entry_allowed:
-            reasons = list(reasons) + [f"entry_cutoff_min: {max(mins_to_close, 0)} min to close"]
-            ok = False
+        if sym in positions:
+            reasons = ["already in position"]
 
-        if ok and sym in pos_map and float(pos_map[sym].get("qty", 0)) > 0:
-            reasons = list(reasons) + ["already in position"]
-            ok = False
-
-        # Log gate
-        log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision=("ALLOW" if ok else "BLOCK"), reasons=reasons)
-
-        # Place order if allowed
-        if not ok or not brackets_enabled:
+        if reasons:
+            log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision="BLOCK", reasons=reasons)
             continue
+        else:
+            log.gate(symbol=sym, session=session, cid=sig_row["cid"], decision="ALLOW", reasons=[])
 
         # ATR-based brackets
-        atr_len = int(cfg.get("atr_length", 14))
-        try:
-            atr_series = _atr(df, period=atr_len)
-            atr_val = float(atr_series.iloc[-1])
-        except Exception:
-            atr_val = float("nan")
-
-        entry = float(last.get("close", 0.0))
-        if not (atr_val > 0 and entry > 0):
-            print(f"[order] skip {sym}: invalid ATR/entry (ATR={atr_val}, entry={entry})", flush=True)
+        if not brackets.get("enabled", True):
             continue
 
-        risk_per_share = atr_mult_sl * atr_val
-        stop_price = round(entry - risk_per_share, 2)
-        take_profit = round(entry + tp_r * risk_per_share, 2)
+        atr_len = int(cfg.get("atr_length", 14))
+        # Simple ATR from True Range mean over last atr_len
+        tr = pd.concat(
+            [
+                (df["high"] - df["low"]),
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"] - df["close"].shift(1)).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(atr_len, min_periods=atr_len).mean()
+        atr_val = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
+
+        entry = float(last["close"])
+        sl_mult = float(brackets.get("atr_mult_sl", 1.2))
+        tp_r = float(brackets.get("take_profit_r", 1.8))
+
+        stop_price = round(entry - sl_mult * atr_val, 2)
+        r = entry - stop_price
+        take_profit = round(entry + tp_r * r, 2)
 
         # Min-tick guard to avoid 422 "take_profit.limit_price >= base_price + 0.01"
+        tick_size = float(brackets.get("min_tick", 0.01))
         if take_profit <= entry + tick_size - 1e-9:
             take_profit = round(entry + tick_size, 2)
 
         if not (stop_price < entry < take_profit):
             print(f"[order] skip {sym}: bad TP/SL (entry={entry}, sl={stop_price}, tp={take_profit})", flush=True)
+            try:
+                log.entry_reject(
+                    symbol=sym,
+                    session=session,
+                    cid=sig_row["cid"],
+                    reason="BAD_TP_SL",
+                    details={"entry": round(entry, 2), "sl": stop_price, "tp": take_profit},
+                )
+            except Exception:
+                pass
             continue
 
         # Size
         qty = max(1, min(base_qty, max_shares))
         qty = _cap_qty_by_notional(qty, entry, max_notional)
         if qty < 1:
-            print(f"[order] skip {sym}: qty<1 after notional cap (entry={entry}, max_notional={max_notional})", flush=True)
+            print(
+                f"[order] skip {sym}: qty<1 after notional cap (entry={entry}, max_notional={max_notional})",
+                flush=True,
+            )
+            try:
+                log.entry_reject(
+                    symbol=sym,
+                    session=session,
+                    cid=sig_row["cid"],
+                    reason="QTY_LT_1_AFTER_CAP",
+                    details={"entry": round(entry, 2), "max_notional": max_notional},
+                )
+            except Exception:
+                pass
             continue
 
+        # Log the planned order (visible in results jsonl)
+        try:
+            log.entry_submit(
+                symbol=sym,
+                session=session,
+                cid=sig_row["cid"],
+                qty=qty,
+                side="buy",
+                entry_price=round(entry, 2),
+                stop_loss_price=stop_price,
+                take_profit_price=take_profit,
+                atr=round(atr_val, 4),
+                method="bracket",
+                tif="day",
+                dry_run=bool(args.dry_run),
+            )
+        except Exception:
+            pass
+
         if args.dry_run:
-            print(f'[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} '
-                  f'sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})', flush=True)
+            print(
+                f"[order] DRY-RUN: would submit BRACKET {sym} qty={qty} entry≈{entry:.2f} "
+                f"sl={stop_price:.2f} tp={take_profit:.2f} (ATR={atr_val:.3f})",
+                flush=True,
+            )
+            try:
+                log.entry_ack(
+                    symbol=sym,
+                    session=session,
+                    cid=sig_row["cid"],
+                    order_id=None,
+                    client_order_id=None,
+                    broker_resp=None,
+                    dry_run=True,
+                )
+            except Exception:
+                pass
         else:
             try:
                 resp = submit_bracket_order(
-                    broker["base_url"], broker["key"], broker["secret"],
-                    symbol=sym, qty=qty, side="buy",
+                    cfg["broker"]["base_url"],
+                    cfg["broker"]["key"],
+                    cfg["broker"]["secret"],
+                    symbol=sym,
+                    qty=qty,
+                    side="buy",
                     limit_price=None,  # market entry
                     take_profit_price=take_profit,
                     stop_loss_price=stop_price,
@@ -285,8 +425,32 @@ def main() -> int:
                 )
                 # Even if 422 returns JSON error, we print it here for visibility
                 print(f"[order] BRACKET submitted for {sym}: {json.dumps(resp)[:300]}", flush=True)
+                try:
+                    oid = (resp.get("id") if isinstance(resp, dict) else None)
+                    coid = (resp.get("client_order_id") if isinstance(resp, dict) else None)
+                    log.entry_ack(
+                        symbol=sym,
+                        session=session,
+                        cid=sig_row["cid"],
+                        order_id=oid,
+                        client_order_id=coid,
+                        broker_resp=resp,
+                        dry_run=False,
+                    )
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[order] ERROR submitting bracket for {sym}: {e}", flush=True)
+                try:
+                    log.entry_reject(
+                        symbol=sym,
+                        session=session,
+                        cid=sig_row["cid"],
+                        reason="BROKER_ERROR",
+                        details={"error": str(e)},
+                    )
+                except Exception:
+                    pass
 
     try:
         log.close()
