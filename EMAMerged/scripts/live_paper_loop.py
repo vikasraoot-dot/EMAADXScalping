@@ -197,7 +197,8 @@ def main() -> int:
         return 0
     print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_utc.isoformat()}))
 
-    # Fetch bars
+    # Fetch bars  (NOTE: function expects (symbols, timeframe, history_days, feed))
+    feed = cfg.get("feed", "iex")
     print(
         json.dumps(
             {
@@ -205,7 +206,7 @@ def main() -> int:
                 "requested": len(symbols),
                 "chunks": 2,
                 "timeframe": timeframe,
-                "feed": cfg.get("feed", "iex"),
+                "feed": feed,
                 "start": (now_utc - timedelta(days=history_days)).isoformat(),
                 "end": now_utc.isoformat(),
                 "when": now_utc.isoformat(),
@@ -213,7 +214,7 @@ def main() -> int:
         ),
         flush=True,
     )
-    bars_map, bars_meta = fetch_latest_bars(symbols, history_days, timeframe, cfg.get("feed", "iex"))
+    bars_map, bars_meta = fetch_latest_bars(symbols, timeframe, history_days, feed)
 
     # Summary
     with_data = sorted([s for s, d in bars_map.items() if isinstance(d, pd.DataFrame) and not d.empty])
@@ -242,7 +243,7 @@ def main() -> int:
                 "requested": len(symbols),
                 "timeframe": timeframe,
                 "history_days": history_days,
-                "feed": cfg.get("feed", "iex"),
+                "feed": feed,
                 "http_errors": bars_meta.get("http_errors", []),
                 "symbols_with_data": with_data,
                 "symbols_empty": empty,
@@ -279,7 +280,6 @@ def main() -> int:
     # breakeven = cfg.get("breakeven", {}) or {}  # (not used here)
 
     # Size guard
-    allow_shorts = bool(cfg.get("allow_shorts", False))  # long-only here
     base_qty = int(cfg.get("qty", 1))
     max_shares = int(cfg.get("max_shares_per_trade", base_qty))
     max_notional = cfg.get("max_notional_per_trade", None)
@@ -314,7 +314,7 @@ def main() -> int:
             "ema_slope_pct": slope,
             "rsi": float(rsi_val) if not np.isnan(rsi_val) else None,
         }
-        TradeLogger.signal(log, **sig_row)  # explicit, but same as log.signal(**sig_row)
+        TradeLogger.signal(log, **sig_row)
 
         # Gate
         reasons = []
@@ -387,11 +387,6 @@ def main() -> int:
             continue
 
         # Size
-        base_qty = int(cfg.get("qty", 1))
-        max_shares = int(cfg.get("max_shares_per_trade", base_qty))
-        max_notional = cfg.get("max_notional_per_trade", None)
-        max_notional = float(max_notional) if max_notional not in (None, "", "0") else None
-
         qty = max(1, min(base_qty, max_shares))
         qty = _cap_qty_by_notional(qty, entry, max_notional)
         if qty < 1:
