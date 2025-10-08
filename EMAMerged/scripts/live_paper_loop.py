@@ -92,6 +92,32 @@ def _pretty_timeframe(tf: str) -> str:
     return tf
 
 
+def _broker_creds(cfg: dict) -> tuple[str, str, str]:
+    """Pull broker creds from config or environment, with safe defaults."""
+    broker = cfg.get("broker", {}) or {}
+    base_url = broker.get("base_url") or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    # Support both env name variants
+    key = broker.get("key") or os.getenv("ALPACA_KEY_ID") or os.getenv("APCA_API_KEY_ID") or ""
+    secret = broker.get("secret") or os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY") or ""
+    return base_url, key, secret
+
+
+def _alpaca_market_open_compat(base_url: str, key: str, secret: str) -> bool:
+    """Call alpaca_market_open with credentials; fall back to 0-arg signature if present."""
+    try:
+        return bool(alpaca_market_open(base_url, key, secret))
+    except TypeError:
+        return bool(alpaca_market_open())
+
+
+def _get_positions_compat(base_url: str, key: str, secret: str):
+    """Call get_positions with credentials; fall back to 0-arg signature if present."""
+    try:
+        return get_positions(base_url, key, secret)
+    except TypeError:
+        return get_positions()
+
+
 def attach_verifiers(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
     Append all indicators + helper columns used by gates.
@@ -147,6 +173,9 @@ def main() -> int:
     log_path = os.path.join(results_dir, f"live_{_utc_stamp('%Y%m%d')}.jsonl")
     log = TradeLogger(log_path)
 
+    # Broker creds (for market/positions/order calls)
+    base_url, key, secret = _broker_creds(cfg)
+
     # Universe
     symbols = load_symbols_from_file(args.tickers)
     print(
@@ -163,7 +192,7 @@ def main() -> int:
         return 0
 
     # Market open check (paper)
-    if not alpaca_market_open():
+    if not _alpaca_market_open_compat(base_url, key, secret):
         print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": False, "ts": now_utc.isoformat()}))
         return 0
     print(json.dumps({"type": "HEARTBEAT", "session": session, "market_open": True, "ts": now_utc.isoformat()}))
@@ -234,7 +263,8 @@ def main() -> int:
     print(json.dumps({"type": "BARS_SNAPSHOT", "sample": snap[:50]}), flush=True)
 
     # Current positions (for "already in position" gate)
-    positions = {p["symbol"]: p for p in get_positions() or []}
+    positions_raw = _get_positions_compat(base_url, key, secret) or []
+    positions = {p["symbol"]: p for p in positions_raw}
 
     # Filters
     fcfg = cfg.get("filters", {}) or {}
@@ -284,7 +314,7 @@ def main() -> int:
             "ema_slope_pct": slope,
             "rsi": float(rsi_val) if not np.isnan(rsi_val) else None,
         }
-        log.signal(**sig_row)
+        TradeLogger.signal(log, **sig_row)  # explicit, but same as log.signal(**sig_row)
 
         # Gate
         reasons = []
@@ -357,6 +387,11 @@ def main() -> int:
             continue
 
         # Size
+        base_qty = int(cfg.get("qty", 1))
+        max_shares = int(cfg.get("max_shares_per_trade", base_qty))
+        max_notional = cfg.get("max_notional_per_trade", None)
+        max_notional = float(max_notional) if max_notional not in (None, "", "0") else None
+
         qty = max(1, min(base_qty, max_shares))
         qty = _cap_qty_by_notional(qty, entry, max_notional)
         if qty < 1:
@@ -416,9 +451,9 @@ def main() -> int:
         else:
             try:
                 resp = submit_bracket_order(
-                    cfg["broker"]["base_url"],
-                    cfg["broker"]["key"],
-                    cfg["broker"]["secret"],
+                    base_url,
+                    key,
+                    secret,
                     symbol=sym,
                     qty=qty,
                     side="buy",
