@@ -78,7 +78,7 @@ filters:
   rsi_period: 14             # comes from rsi_length above if omitted
   rsi_min: 50                # reference rsi_long_min
   rsi_max: 80                # reference rsi_long_max
-  slope_threshold_pct: 0.0010  # require EMA_fast slope ≥ +0.10% per bar
+  slope_threshold_pct: 0.00040  # require EMA_fast slope ≥ +0.10% per bar
   dollar_vol_window: 20
   dollar_vol_min_periods: 7
   require_fast_above_slow: true
