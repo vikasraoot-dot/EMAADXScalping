@@ -74,7 +74,7 @@ breakeven:
 # FILTERS / GATES (now fully config-driven)
 # ──────────────────────────────────────────────────────────────────────────────
 filters:
-  adx_threshold: 23.0        # trend strength gate (raise to 25.0 for stricter)
+  adx_threshold: 20        # trend strength gate (raise to 25.0 for stricter)
   rsi_period: 14             # comes from rsi_length above if omitted
   rsi_min: 50                # reference rsi_long_min
   rsi_max: 80                # reference rsi_long_max
