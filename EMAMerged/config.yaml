@@ -76,8 +76,8 @@ breakeven:
 filters:
   adx_threshold: 20        # trend strength gate (raise to 25.0 for stricter)
   rsi_period: 14             # comes from rsi_length above if omitted
-  rsi_min: 50                # reference rsi_long_min
-  rsi_max: 80                # reference rsi_long_max
+  rsi_min: 48                # reference rsi_long_min
+  rsi_max: 85                # reference rsi_long_max
   slope_threshold_pct: 0.00040  # require EMA_fast slope ≥ +0.10% per bar
   dollar_vol_window: 20
   dollar_vol_min_periods: 7
