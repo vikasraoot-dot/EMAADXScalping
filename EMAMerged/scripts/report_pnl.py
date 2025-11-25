@@ -104,7 +104,8 @@ def main():
         pnl_summary.append({
             "Ticker": sym,
             "Trades": len(group),
-            "Volume": buys + sells,
+            "Cost Basis": buys,
+            "Sell Price": sells,
             "Net PnL": net_pnl
         })
 
