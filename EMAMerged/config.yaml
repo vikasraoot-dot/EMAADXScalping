@@ -52,7 +52,7 @@ entry_cutoff_min: 20                # block NEW entries within last N minutes
 
 # POSITION / SIZING
 allow_shorts: false
-qty: 1
+qty: 10000                          # increased to allow notional sizing (was 1)
 max_shares_per_trade: 10000         # increased to allow notional sizing
 max_open_trades_per_ticker: 1       # reference knob (enforced in live loop)
 max_notional_per_trade: 2000        # hard cap per order
