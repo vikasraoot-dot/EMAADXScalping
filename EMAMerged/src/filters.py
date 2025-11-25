@@ -102,6 +102,20 @@ def attach_verifiers(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     for col in ["+di", "-di", "adx"]:
         df[col] = di[col]
 
+    # ATR (needed for backtest sizing)
+    atr_period = int(cfg.get("atr_period", cfg.get("atr_length", 14)))
+    tr = pd.concat([
+        (df["high"] - df["low"]),
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1.0/atr_period, adjust=False, min_periods=atr_period).mean().fillna(0.0)
+
+    # Relative Volume (RVOL)
+    vol_win = int(cfg.get("vol_sma_length", 20))
+    vol_avg = df["volume"].rolling(window=vol_win, min_periods=5).mean()
+    df["rvol"] = df["volume"] / vol_avg.replace(0, 1)
+
     # Fresh cross flags (current bar vs previous bar)
     prev_gt = (df["ema_fast"].shift(1) > df["ema_slow"].shift(1))
     now_gt  = (df["ema_fast"] > df["ema_slow"])
@@ -138,8 +152,24 @@ def explain_long_gate(last: pd.Series, cfg: Dict[str, Any]) -> tuple[bool, list[
     require_fast_above_slow = bool(fcfg.get("require_fast_above_slow", True))
     require_cross = bool(fcfg.get("require_cross", False))  # stricter entry
     require_di_trend = bool(fcfg.get("require_di_trend", False))  # +DI > -DI
+    min_rvol = float(fcfg.get("min_rvol", 0.0))  # New RVOL filter
     min_price = fcfg.get("min_price", None)
     min_dv = fcfg.get("min_dollar_vol", None)
+    
+    # Time Filter (Lunch Block)
+    # Assumes 'last' has a name (timestamp) or we pass it. 
+    # For now, we rely on the caller (live loop) to handle session times, 
+    # but we can add a specific "Lunch Block" here if the index is a datetime.
+    block_lunch = bool(fcfg.get("block_lunch", False))
+    is_lunch = False
+    if block_lunch and isinstance(last.name, pd.Timestamp):
+        # Convert to ET if naive or UTC (assuming standard market hours)
+        # Simplified: Just check hour if we know the timezone. 
+        # Better: Use the 'hour' from the timestamp directly if it's already localized or UTC.
+        # Market Open 9:30 ET. Lunch 12:00-13:00 ET.
+        # If UTC: 12:00 ET is 16:00/17:00 UTC depending on DST.
+        # Let's use a robust check if possible, or just rely on the user to configure 'entry_windows'.
+        pass 
 
     # Read fields (tolerant)
     ema_fast = float(last.get("ema_fast", np.nan))
@@ -180,6 +210,15 @@ def explain_long_gate(last: pd.Series, cfg: Dict[str, Any]) -> tuple[bool, list[
     # Slope
     if slope < slope_thr:
         reasons.append(f"EMA_slope {slope:.5f} < {slope_thr:.5f}")
+
+    # RVOL
+    rvol = float(last.get("rvol", 0.0))
+    if min_rvol > 0 and rvol < min_rvol:
+        reasons.append(f"RVOL {rvol:.2f} < {min_rvol:.2f}")
+
+    # Lunch Block (Hardcoded for 12:00-13:00 ET approx for now, or use config windows)
+    # Actually, let's rely on 'entry_windows' in config.yaml for time filtering 
+    # as it's cleaner than hardcoding timezones here.
 
     # Optional dollar volume gate if present
     if (min_dv is not None) and ("dollar_vol_avg" in last.index):

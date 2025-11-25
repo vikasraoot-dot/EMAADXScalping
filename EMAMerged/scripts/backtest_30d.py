@@ -20,7 +20,7 @@ if _REPO_ROOT not in sys.path:
 
 from EMAMerged.src.utils import load_config, read_tickers
 from EMAMerged.src.data import (
-    get_alpaca_bars,
+    fetch_latest_bars,
     filter_rth,
     drop_unclosed_last_bar,
 )
@@ -130,14 +130,15 @@ def _eval_long_reasons(prev: pd.Series, cfg: dict, mtf_bias_ok: bool) -> list:
 def load_bars_for_symbol(symbol: str, cfg: dict, days: int,
                          timeframe_override=None, limit_override=None, rth_only_override=True) -> pd.DataFrame:
     """
-    Uses EMAMerged/src/data.get_alpaca_bars(key, secret, symbol, timeframe, history_days, bar_limit, feed)
-    and EMAMerged/src/data.filter_rth(df, tz_name, rth_start, rth_end, ...).
+    Uses EMAMerged/src/data.fetch_latest_bars to get historical bars.
     """
     timeframe = timeframe_override or cfg.get("timeframe", "15Min")
     feed = cfg.get("feed", "iex")
     tz_name = cfg.get("timezone", "US/Eastern")
+    rth_start = cfg.get("rth_start", "09:30")
+    rth_end = cfg.get("rth_end", "15:55")
 
-    # Pull creds from env (consistent with data.get_alpaca_bars usage)
+    # Pull creds from env
     key = os.getenv("APCA_API_KEY_ID", "")
     secret = os.getenv("APCA_API_SECRET_KEY", "")
 
@@ -147,24 +148,26 @@ def load_bars_for_symbol(symbol: str, cfg: dict, days: int,
     # bar_limit: prefer CLI override if provided, else config bar_limit, else fallback
     bar_limit = int(limit_override) if (limit_override is not None) else int(cfg.get("bar_limit", 10000))
 
-    df = get_alpaca_bars(
-        key=key,
-        secret=secret,
-        symbol=symbol,
+    # fetch_latest_bars returns (bars_map, metadata) tuple
+    bars_map, _ = fetch_latest_bars(
+        symbols=[symbol],
         timeframe=timeframe,
         history_days=history_days,
-        bar_limit=bar_limit,
         feed=feed,
+        rth_only=rth_only_override,
+        tz_name=tz_name,
+        rth_start=rth_start,
+        rth_end=rth_end,
+        bar_limit=bar_limit,
+        key=key,
+        secret=secret,
     )
+    
+    df = bars_map.get(symbol, pd.DataFrame())
     if df.empty:
         return df
 
-    df = drop_unclosed_last_bar(df,timeframe)
-
-    if rth_only_override:
-        df = filter_rth(df, tz_name, cfg.get("rth_start", "09:30"), cfg.get("rth_end", "15:55"))
-
-    # Keep approx last N days at 15m cadence for consistency with old prints
+    # Keep approx last N days at 15m cadence for consistency
     bars_per_day_15m = 390 // 15  # 26 bars
     approx_rows = int(days) * bars_per_day_15m
     return df.tail(approx_rows)
@@ -215,6 +218,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
     losses = 0
     gross = 0.0
     trades_printed = []
+    detailed_trades = [] # List of dicts for CSV export
 
     for i in range(1, len(df)):
         prev = df.iloc[i - 1]
@@ -225,7 +229,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
             x = crossover(df.iloc[:i])
             if x == 1:
                 mtf_ok = True if not mtf_enabled else bool(prev.get("htf_bias", False))
-                if not long_ok(prev, cfg, ema_fast_col="ema_fast", ema_slow_col="ema_slow") or not mtf_ok:
+                if not long_ok(prev, cfg) or not mtf_ok:
                     reasons = _eval_long_reasons(prev, cfg, mtf_ok)
                     if reasons:
                         print("    REJECT {}: {}".format(cur.name, "; ".join(reasons)))
@@ -258,6 +262,16 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
                 entry_px = open_px
                 in_pos = True
                 entry_ts = cur.name
+                
+                # Capture entry state
+                entry_state = {
+                    "adx": float(prev.get("adx", 0)),
+                    "rsi": float(prev.get("rsi", 0)),
+                    "slope": float(prev.get("ema_slope_pct", 0)),
+                    "rvol": float(prev.get("rvol", 0)),
+                    "atr": float(prev.get("atr", 0)),
+                    "hour": entry_ts.hour,
+                }
 
         else:
             x = crossover(df.iloc[:i])
@@ -283,6 +297,17 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
                 in_pos = False
                 qty = 0
                 trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
+                detailed_trades.append({
+                    "symbol": "UNKNOWN",
+                    "entry_time": entry_ts,
+                    "exit_time": cur.name,
+                    "entry_price": entry_px,
+                    "exit_price": exit_px,
+                    "pnl": pnl,
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "reason": "SL",
+                    **entry_state
+                })
                 continue
 
             if hit_tp:
@@ -294,6 +319,17 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
                 in_pos = False
                 qty = 0
                 trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
+                detailed_trades.append({
+                    "symbol": "UNKNOWN",
+                    "entry_time": entry_ts,
+                    "exit_time": cur.name,
+                    "entry_price": entry_px,
+                    "exit_price": exit_px,
+                    "pnl": pnl,
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "reason": "TP",
+                    **entry_state
+                })
                 continue
 
             if exit_now_on_cross:
@@ -308,6 +344,17 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
                 in_pos = False
                 qty = 0
                 trades_printed.append((entry_ts, entry_px, cur.name, exit_px, pnl))
+                detailed_trades.append({
+                    "symbol": "UNKNOWN",
+                    "entry_time": entry_ts,
+                    "exit_time": cur.name,
+                    "entry_price": entry_px,
+                    "exit_price": exit_px,
+                    "pnl": pnl,
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "reason": "CROSS",
+                    **entry_state
+                })
 
     # Print collected trades (style kept similar)
     for (ent_ts, ent_px, ex_ts, ex_px, pnl) in trades_printed:
@@ -324,6 +371,7 @@ def simulate_long_only(df: pd.DataFrame, cfg: dict, start_cash=10_000.0, risk_pc
         win_rate=round(wr, 1),
         ret_pct=round(ret_pct, 2),
         equity=round(equity, 2),
+        detailed_trades=detailed_trades
     )
 
 
@@ -406,6 +454,20 @@ def main():
     print("\nTOTAL  trades={}  net={}  win_rate={}%%  avg_ret={}%%  equity_sum={}".format(
         total_trades, total_net, avg_winrate, avg_ret, total_equity
     ))
+    
+    # Export detailed trades
+    all_trades = []
+    for r in rows:
+        sym = r["symbol"]
+        for t in r.get("detailed_trades", []):
+            t["symbol"] = sym
+            all_trades.append(t)
+            
+    if all_trades:
+        df_trades = pd.DataFrame(all_trades)
+        csv_path = "trades.csv"
+        df_trades.to_csv(csv_path, index=False)
+        print(f"\nSaved {len(df_trades)} trades to {csv_path}")
     # --- Filter Impact Report ---
     print("\n=== Filter Impact Report ===")
     total_rejects = sum(FILTER_REJECTS.values())

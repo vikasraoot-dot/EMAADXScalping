@@ -181,7 +181,14 @@ def main() -> int:
     # Reference timeframe
     intervals = cfg.get("intervals") or ["15m"]
     timeframe = _pretty_timeframe(intervals[0])  # "15Min"
-    history_days = int(cfg.get("history_days", 30))
+    
+    # Resolve history_days: prefer 'periods' map, fallback to top-level 'history_days'
+    periods_map = cfg.get("periods", {})
+    raw_period = periods_map.get(intervals[0])
+    if raw_period and raw_period.endswith("d"):
+        history_days = int(raw_period.replace("d", ""))
+    else:
+        history_days = int(cfg.get("history_days", 30))
 
     # Session clock
     import pytz

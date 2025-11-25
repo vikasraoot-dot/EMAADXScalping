@@ -20,10 +20,12 @@ rth_only: true
 rth_start: "09:30"
 rth_end:   "15:55"
 
-# Optional entry windows (in timezone above) – skips midday window
+# Entry Windows (Eastern Time) - Block Lunch (12:00-13:00)
 entry_windows:
-  - { start: "09:30", end: "12:10" }
-  - { start: "12:35", end: "15:55" }
+  - start: "09:45"  # Avoid first 15m volatility
+    end: "11:59"
+  - start: "13:00"  # Post-lunch
+    end: "15:45"    # Stop before close
 
 bar_limit: 10000
 feed: "iex"
@@ -60,13 +62,13 @@ max_notional_per_trade: 2000        # hard cap per order
 # ──────────────────────────────────────────────────────────────────────────────
 brackets:
   enabled: true
-  atr_mult_sl: 1.2          # stop distance = 1.2 × ATR   (ref: atr_mult)
-  take_profit_r: 1.8        # TP at +1.8R                  (ref: use_rr_target + rr_target)
+  atr_mult_sl: 1.5          # stop distance = 1.5 × ATR   (ref: atr_mult)
+  take_profit_r: 3.0        # TP at +3.0R                  (ref: use_rr_target + rr_target)
 
 # Optional: breakeven bump at partial R
 breakeven:
   enabled: true
-  trigger_r: 0.5            # at +0.5R, move stop to BE + ticks
+  trigger_r: 0.8            # at +0.8R, move stop to BE + ticks (increased from 0.5R)
   bump_ticks: 2
   tick_size: 0.01
 
@@ -76,9 +78,10 @@ breakeven:
 filters:
   adx_threshold: 20        # trend strength gate (raise to 25.0 for stricter)
   rsi_period: 14             # comes from rsi_length above if omitted
-  rsi_min: 48                # reference rsi_long_min
+  rsi_min: 30                # reference rsi_long_min (relaxed from 48)
   rsi_max: 85                # reference rsi_long_max
-  slope_threshold_pct: 0.00040  # require EMA_fast slope ≥ +0.10% per bar
+  min_rvol: 1.2              # require volume > 1.2x average
+  slope_threshold_pct: 0.00040  # require EMA_fast slope ≥ +0.04% per bar
   dollar_vol_window: 20
   dollar_vol_min_periods: 7
   require_fast_above_slow: true
