@@ -107,9 +107,12 @@ def main():
                 print(f"[loop] within {flatten_mins}m of close → EOD flatten", flush=True)
                 try:
                     subprocess.run([sys.executable, "-u", "EMAMerged/scripts/flat_eod.py"], check=False)
+                    # NEW: Run PnL Report after flattening
+                    print("[loop] Generating Daily PnL Report...", flush=True)
+                    subprocess.run([sys.executable, "-u", "EMAMerged/scripts/report_pnl.py"], check=False)
                     flattened_today = True
                 except Exception as e:
-                    print(f"[loop] EOD flatten error: {e}", flush=True)
+                    print(f"[loop] EOD flatten/report error: {e}", flush=True)
 
         if d >= mc:
             print(f"[loop] reached market close {mc.strftime('%H:%M %Z')} → exiting loop", flush=True)
