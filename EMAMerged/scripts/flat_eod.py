@@ -8,11 +8,20 @@ def _env(name: str, default: str = "") -> str:
     return v if v is not None else default
 
 def _creds():
-    key = _env("ALPACA_API_KEY") or _env("ALPACA_KEY")
-    sec = _env("ALPACA_API_SECRET") or _env("ALPACA_SECRET")
-    base = _env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+    # Try to resolve using the same logic as data.py, or fall back to env vars
+    # We want to support APCA_API_KEY_ID as well.
+    key = _env("APCA_API_KEY_ID") or _env("ALPACA_API_KEY") or _env("ALPACA_KEY") or _env("ALPACA_KEY_ID")
+    sec = _env("APCA_API_SECRET_KEY") or _env("ALPACA_API_SECRET") or _env("ALPACA_SECRET") or _env("ALPACA_SECRET_KEY")
+    
+    # Base URL
+    base = _env("APCA_API_BASE_URL") or _env("APCA_BASE_URL") or _env("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets"
+    base = base.rstrip("/")
+    
     if not key or not sec:
-        raise RuntimeError("Missing ALPACA creds")
+        # If we can't find them here, we'll return None and let data.py try to find them (or fail there)
+        # But data.py functions take optional args.
+        pass
+        
     return base, key, sec
 
 def main():

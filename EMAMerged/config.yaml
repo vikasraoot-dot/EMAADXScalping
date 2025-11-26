@@ -47,7 +47,7 @@ adx_period: 14        # NEW: DI/ADX calculation length
 # ──────────────────────────────────────────────────────────────────────────────
 # RISK CONTROLS
 # ──────────────────────────────────────────────────────────────────────────────
-flatten_minutes_before_close: 5     # flatten before close
+flatten_minutes_before_close: 15    # flatten before close (increased to 15m to ensure execution)
 entry_cutoff_min: 20                # block NEW entries within last N minutes
 
 # POSITION / SIZING
